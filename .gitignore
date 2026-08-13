@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Generated exports stay outside source control.
+导出数据/
+exports/
+exports-*/
+test-*/
+.export-smoke-test/
