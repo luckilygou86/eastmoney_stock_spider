@@ -7,3 +7,12 @@ exports/
 exports-*/
 test-*/
 .export-smoke-test/
+.stock_spider_state.json
+.stock-ui-*.tmp
+.stock-export-*/
+
+# Never commit AI credentials or locally configured secrets.
+.env
+.env.*
+.stock-ai-*
+*chatgpt-credentials*

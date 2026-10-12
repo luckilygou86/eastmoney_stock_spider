@@ -1,2 +1,4 @@
-# 新浪历史日线压缩数据使用 JavaScript 解码；其余功能仍使用标准库。
+# 新浪历史日线压缩数据使用 JavaScript 解码。
 py-mini-racer==0.6.0
+# 官方 ChatGPT 登录需要验证 ID Token 签名；API Key 模式不依赖此库。
+PyJWT[crypto]>=2.10,<3

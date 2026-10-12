@@ -1,4 +1,4 @@
-"""Stock data desktop collector. Standard library only."""
+"""Stock data desktop collector with optional historical-data decoder."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ import json
 import math
 import os
 import re
+import queue
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
@@ -24,12 +28,13 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from sina_decoder import SINA_KLC_DECODER
+from analysis_tools import build_quality_checks, summarize_dashboard
+
 try:
     from py_mini_racer import py_mini_racer
-    from sina_decoder import SINA_KLC_DECODER
 except ImportError:  # The collector keeps working with the existing fallbacks.
     py_mini_racer = None
-    SINA_KLC_DECODER = ""
 
 
 APP_TITLE = "\u80a1\u7968\u6570\u636e\u91c7\u96c6\u5668"
@@ -79,7 +84,8 @@ def num(value: Any, default: float | None = None) -> float | None:
     try:
         if value in (None, "", "-", "--"):
             return default
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
@@ -102,6 +108,72 @@ def fmt(value: Any, decimals: int = 2) -> str:
     return "-" if n is None else f"{n:,.{decimals}f}"
 
 
+def market_timestamp(value: Any) -> str:
+    """Canonical China-market timestamp; supports provider Unix timestamps."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    try:
+        if len(digits) == 14:
+            datetime.strptime(digits, "%Y%m%d%H%M%S")
+            return digits
+        if len(digits) == 8:
+            datetime.strptime(digits, "%Y%m%d")
+            return digits
+        timestamp = num(value)
+        if timestamp is not None and 1000000000 <= timestamp < 10000000000:
+            return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=8))).strftime("%Y%m%d%H%M%S")
+    except (ValueError, OverflowError, OSError):
+        pass
+    return ""
+
+
+def market_date(value: Any) -> str:
+    stamp = market_timestamp(value)
+    return f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}" if len(stamp) >= 8 else ""
+
+
+def merge_quote_precision(base: dict[str, Any], precise: dict[str, Any]) -> bool:
+    """Only mix snapshots when their security, trading date, volume and price agree."""
+    base_date, other_date = market_date(base.get("f86")), market_date(precise.get("f86"))
+    volume, other_volume = num(base.get("f47")), num(precise.get("f47"))
+    price, other_price = num(base.get("f43")), num(precise.get("f43"))
+    if not base_date or base_date != other_date or str(base.get("f57")) != str(precise.get("f57")):
+        return False
+    if volume is None or other_volume is None or abs(volume - other_volume) > 0.001:
+        return False
+    if price is None or other_price is None or abs(price - other_price) > 0.001:
+        return False
+    for field in ("f48", "f116", "f117"):
+        if num(precise.get(field)) is not None:
+            base[field] = num(precise[field])
+    return True
+
+
+def decode_sina_daily(encoded: str) -> list[dict[str, Any]]:
+    if py_mini_racer is not None:
+        try:
+            context = py_mini_racer.MiniRacer()
+            context.eval(SINA_KLC_DECODER)
+            return context.call("d", encoded) or []
+        except Exception as exc:
+            raise SpiderError(f"Sina daily decode failed: {exc}") from exc
+    node = shutil.which("node")
+    if not node:
+        raise SpiderError("历史日线解码需要 py-mini-racer 或已安装的 Node.js；原有行情数据仍可使用")
+    script = SINA_KLC_DECODER + "\nconst x=require('fs').readFileSync(0,'utf8');process.stdout.write(JSON.stringify(d(JSON.parse(x))));"
+    try:
+        completed = subprocess.run(
+            [node, "-e", script], input=json.dumps(encoded), text=True,
+            encoding="utf-8", capture_output=True, timeout=30, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        decoded = json.loads(completed.stdout)
+        if not isinstance(decoded, list):
+            raise ValueError("decoder did not return daily records")
+        return decoded
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise SpiderError(f"Sina daily decode failed: {exc}") from exc
+
+
 class Client:
     def __init__(self, timeout: int = 12, pause: float = 0.08):
         self.timeout = timeout
@@ -115,7 +187,7 @@ class Client:
         except urllib.error.HTTPError as exc:
             raise SpiderError(f"HTTP {exc.code}: {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            fallback = self._powershell_json(url, referer) if powershell_fallback else None
+            fallback = self._powershell_json(url, referer, timeout=max(1, min(self.timeout, 5))) if powershell_fallback else None
             if fallback is not None:
                 result = fallback
             else:
@@ -128,19 +200,19 @@ class Client:
         return result
 
     @staticmethod
-    def _powershell_json(url: str, referer: str) -> dict[str, Any] | None:
+    def _powershell_json(url: str, referer: str, timeout: int = 5) -> dict[str, Any] | None:
         """Use Windows' request stack when a local proxy closes urllib connections."""
         if os.name != "nt":
             return None
         escaped = url.replace("'", "''")
         command = (
             "$ProgressPreference='SilentlyContinue'; "
-            "$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 18 "
+            f"$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec {timeout} "
             f"-Uri '{escaped}' -Headers @{{'User-Agent'='Mozilla/5.0';'Referer'='{referer}'}}; "
             "$r.Content"
         )
         try:
-            completed = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, timeout=25, check=False)
+            completed = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, timeout=timeout + 2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if completed.returncode != 0 or not completed.stdout:
                 return None
             return json.loads(completed.stdout.decode("utf-8-sig", errors="replace"))
@@ -185,6 +257,10 @@ class Client:
         p = match.group(1).split("~")
         if len(p) < 40:
             raise SpiderError("Tencent quote fields incomplete")
+        if p[2] != identity.code:
+            raise SpiderError("腾讯行情返回的证券代码与查询不一致，已拒绝合并")
+        if num(p[3]) is None or num(p[3]) <= 0 or not market_timestamp(p[30]):
+            raise SpiderError("腾讯行情价格或时间戳无效，已保留原快照")
         data = {
             "f57": p[2], "f58": p[1], "f43": p[3], "f60": p[4], "f46": p[5], "f47": p[6],
             "f48": (p[35].split("/")[-1] if len(p) > 35 and "/" in p[35] else (p[37] if len(p) > 37 else None)), "f44": p[33] if len(p) > 33 else None,
@@ -203,7 +279,7 @@ class Client:
         secid = urllib.parse.quote(identity.secid, safe=".")
         query = (
             "/api/qt/stock/get?"
-            f"secid={secid}&fields=f48,f57,f58,f116,f117,f168"
+            f"secid={secid}&fltt=2&fields=f43,f47,f48,f57,f58,f86,f116,f117,f168"
         )
         last_error: SpiderError | None = None
         for host in ("push2delay.eastmoney.com", "push2.eastmoney.com"):
@@ -215,6 +291,19 @@ class Client:
             except SpiderError as exc:
                 last_error = exc
         raise last_error or SpiderError("Eastmoney precise quote empty")
+
+    def quote_snapshot(self, identity: StockIdentity, include_precision: bool = True) -> dict[str, Any]:
+        payload = self.tencent_quote(identity)
+        if not include_precision:
+            payload["meta"] = {"precision_matched": False, "precision_deferred": True}
+            return payload
+        try:
+            precise = (self.eastmoney_quote_precision(identity).get("data") or {})
+            matched = merge_quote_precision(payload.get("data") or {}, precise)
+            payload["meta"] = {"precision_matched": matched}
+        except SpiderError as exc:
+            payload["meta"] = {"precision_matched": False, "precision_error": str(exc)}
+        return payload
 
     def tencent_intraday(self, identity: StockIdentity) -> dict[str, Any]:
         prefix = identity.market if identity.market in {"sh", "sz", "bj"} else "sz"
@@ -241,7 +330,8 @@ class Client:
             prev = price
             prev_volume = cumulative_volume
             prev_turnover = cumulative_turnover
-        return {"data": {"trends": lines}}
+        trade_date = market_date(box.get("date"))
+        return {"data": {"trends": lines}, "meta": {"trade_date": trade_date}}
 
     def tencent_deals(self, identity: StockIdentity) -> dict[str, Any]:
         """Return all available pages from Tencent's three-second detail feed."""
@@ -253,7 +343,9 @@ class Client:
                 try:
                     raw = self.text(url)
                     match = re.search(r"=\[\d+,\"(.*?)\"\]", raw, re.S)
-                    return page, (match.group(1).split("|") if match else [])
+                    if not match:
+                        raise SpiderError("Tencent detail response format invalid")
+                    return page, (match.group(1).split("|") if match.group(1) else [])
                 except SpiderError:
                     continue
             return page, None
@@ -261,6 +353,8 @@ class Client:
         page_rows: dict[int, list[str]] = {}
         failed_pages: set[int] = set()
         tail_page: int | None = None
+        consecutive_failed_batches = 0
+        network_interrupted = False
         # 按批次继续请求，直到遇到不足 70 条的尾页。活跃股票可能超过
         # 64 页，所以不再使用固定 64 页上限。
         for start in range(0, 200, 8):
@@ -273,6 +367,14 @@ class Client:
                         batch_results[page] = items
                     except Exception:
                         continue
+            if not any(items is not None for items in batch_results.values()):
+                consecutive_failed_batches += 1
+                if not page_rows:
+                    raise SpiderError("腾讯成交明细连续重试失败，已停止本次请求；不会把网络中断当作空尾页")
+                if consecutive_failed_batches >= 2:
+                    network_interrupted = True
+            else:
+                consecutive_failed_batches = 0
             for page in range(start, start + 8):
                 items = batch_results.get(page)
                 if items is None:
@@ -283,11 +385,13 @@ class Client:
                     tail_page = page if tail_page is None else min(tail_page, page)
             if tail_page is not None:
                 break
+            if network_interrupted:
+                break
 
         # 尾页之前的网络失败页不能被当作“没有更多数据”；单独重试，避免
         # 少一页仍被标记为完整。
         required_end = tail_page if tail_page is not None else max(page_rows, default=-1)
-        for page in sorted(page for page in failed_pages if page <= required_end):
+        for page in sorted(page for page in failed_pages if page <= required_end and not network_interrupted):
             _, items = get_page(page)
             if items is not None:
                 page_rows[page] = items
@@ -308,8 +412,8 @@ class Client:
             raise SpiderError("Tencent deal detail empty")
         expected = max(indexed) + 1
         missing = sorted(set(range(expected)) - set(indexed))
-        coverage_complete = tail_page is not None and not missing
-        return {"data": {"details": lines}, "meta": {"complete": False, "coverage_complete": coverage_complete, "count": len(lines), "pages": len(page_rows), "format": "tencent", "source_note": "腾讯3秒汇总备用（不是原始逐笔）", "index_max": max(indexed), "missing_indices": missing[:20], "missing_count": len(missing)}}
+        coverage_complete = tail_page is not None and not missing and not network_interrupted
+        return {"data": {"details": lines}, "meta": {"complete": False, "coverage_complete": coverage_complete, "count": len(lines), "pages": len(page_rows), "format": "tencent", "source_note": "腾讯3秒汇总备用（不是原始逐笔）", "index_max": max(indexed), "missing_indices": missing[:20], "missing_count": len(missing), "network_interrupted": network_interrupted, "page_limit_reached": tail_page is None and not network_interrupted}}
 
     def deals(self, identity: StockIdentity) -> dict[str, Any]:
         """Page-equivalent逐笔优先，网络关闭时切换到可用备用流。"""
@@ -350,7 +454,7 @@ class Client:
             lines.append(",".join(str(x if x is not None else "") for x in [date, *values[:4], volume_lots, turnover]))
         return {"data": {"klines": lines}}
 
-    def tencent_daily(self, identity: StockIdentity) -> dict[str, Any]:
+    def tencent_daily(self, identity: StockIdentity, include_raw: bool = True) -> dict[str, Any]:
         """Tencent qfq daily lines plus raw OHLC used to expose adjustment factors."""
         prefix = identity.market if identity.market in {"sh", "sz", "bj"} else "sz"
         symbol = prefix + identity.code
@@ -367,55 +471,65 @@ class Client:
             lines.append(",".join(str(value if value is not None else "") for value in (date, open_price, close, high, low, volume, turnover)))
         if not lines:
             raise SpiderError("Tencent daily kline empty")
+        if not include_raw:
+            return {"data": {"klines": lines}, "meta": {"adjustment": "qfq"}}
         raw_by_date: dict[str, dict[str, Any]] = {}
         try:
-            raw_url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={symbol},day,,,640"
-            raw_payload = self.json(raw_url, "https://gu.qq.com/")
-            raw_box = ((raw_payload.get("data") or {}).get(symbol) or {})
-            for row in raw_box.get("day") or []:
-                if isinstance(row, list) and len(row) >= 6:
-                    raw_by_date[str(row[0])] = {
-                        "不复权开盘": num(row[1]), "不复权收盘": num(row[2]),
-                        "不复权最高": num(row[3]), "不复权最低": num(row[4]),
-                    }
+            raw_by_date = self.tencent_raw_daily(identity)
         except SpiderError:
             # qfq series remains usable; the exported field status makes the
             # missing raw-price companion explicit instead of silently guessing.
             raw_by_date = {}
         return {"data": {"klines": lines}, "meta": {"raw_by_date": raw_by_date, "adjustment": "qfq"}}
 
+    def tencent_raw_daily(self, identity: StockIdentity) -> dict[str, dict[str, Any]]:
+        symbol = identity.market + identity.code
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={symbol},day,,,640"
+        box = ((self.json(url, "https://gu.qq.com/").get("data") or {}).get(symbol) or {})
+        raw_by_date = {}
+        for row in box.get("day") or []:
+            if isinstance(row, list) and len(row) >= 6:
+                raw_by_date[str(row[0])] = {
+                    "不复权开盘": num(row[1]), "不复权收盘": num(row[2]),
+                    "不复权最高": num(row[3]), "不复权最低": num(row[4]),
+                }
+        if not raw_by_date:
+            raise SpiderError("Tencent raw daily kline empty")
+        return raw_by_date
+
     def sina_daily_exact(self, identity: StockIdentity) -> dict[str, dict[str, Any]]:
         """Return exact daily amount and historical float-share turnover from Sina."""
-        if py_mini_racer is None or not SINA_KLC_DECODER:
-            raise SpiderError("py-mini-racer 未安装，无法解码新浪精确历史成交额")
         symbol = (identity.market if identity.market in {"sh", "sz"} else "sz") + identity.code
         kline_url = f"https://finance.sina.com.cn/realstock/company/{symbol}/hisdata_klc2/klc_kl.js"
         payload = self.text(kline_url, "https://finance.sina.com.cn/")
         match = re.search(r'="([^"]+)"', payload)
         if not match:
             raise SpiderError("Sina exact daily kline empty")
-        try:
-            context = py_mini_racer.MiniRacer()
-            context.eval(SINA_KLC_DECODER)
-            decoded = context.call("d", match.group(1)) or []
-        except Exception as exc:
-            raise SpiderError(f"Sina daily decode failed: {exc}") from exc
+        decoded = decode_sina_daily(match.group(1))
 
         share_url = (
             "https://stock.finance.sina.com.cn/stock/api/jsonp.php/"
             f"var%20KKE_ShareAmount_{symbol}=/StockService.getAmountBySymbol?_=20&symbol={symbol}"
         )
-        share_text = self.text(share_url, "https://finance.sina.com.cn/")
-        share_match = re.search(r"\((\[.*?\])\)", share_text, re.S)
+        share_error = ""
         try:
+            share_text = self.text(share_url, "https://finance.sina.com.cn/")
+            share_match = re.search(r"\((\[.*?\])\)", share_text, re.S)
             share_changes = json.loads(share_match.group(1)) if share_match else []
-        except json.JSONDecodeError:
+            if not isinstance(share_changes, list):
+                raise ValueError("Sina share changes are not a list")
+            if not share_changes:
+                share_error = "历史流通股本接口未提供有效记录"
+        except (SpiderError, ValueError) as exc:
             share_changes = []
+            share_error = str(exc)
         shares_by_date: list[tuple[str, float]] = []
         for row in share_changes:
+            if not isinstance(row, dict):
+                continue
             value = num(row.get("amount"))
-            if row.get("date") and value is not None:
-                shares_by_date.append((str(row["date"])[:10], value * 10000))
+            if row.get("date") and value is not None and value > 0:
+                shares_by_date.append((str(row["date"])[:10], round(value * 10000)))
         shares_by_date.sort()
 
         exact: dict[str, dict[str, Any]] = {}
@@ -435,11 +549,13 @@ class Client:
                 "不复权最高": num(row.get("high")),
                 "不复权最低": num(row.get("low")),
                 "精确成交额": num(row.get("amount")),
+                "新浪成交量(股)": volume_shares,
                 "历史流通股本(股)": current_shares,
                 "精确历史换手率(%)": volume_shares / current_shares * 100 if volume_shares is not None and current_shares else None,
                 "盘后成交量(股)": num(row.get("postVol")),
                 "盘后成交额": num(row.get("postAmt")),
                 "精确历史字段来源": "Sina KLC original daily + historical outstanding-share changes",
+                "历史股本获取说明": share_error,
             }
         if not exact:
             raise SpiderError("Sina exact daily data empty")
@@ -454,7 +570,7 @@ class Client:
         urls = [
             "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=" + secid
             + f"&klt=101&fqt=1&beg={begin}&end=20991231"
-            + "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57",
+            + "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f61",
         ]
         klines: list[str] = []
         last_error: SpiderError | None = None
@@ -547,25 +663,39 @@ class Client:
         return {"\u53e3\u5f84": "\u57fa\u4e8e\u6700\u8fd1OHLCV\u7684\u4f30\u7b97\uff0c\u4e0d\u662f\u4ea4\u6613\u6240\u539f\u59cb\u7b79\u7801\u6570\u636e", "\u5e73\u5747\u6210\u672c": weighted, "\u7b79\u7801\u5cf0": distribution}
     def fetch(self, identity: StockIdentity) -> dict[str, Any]:
         identity = self.resolve(identity)
+        # Independent primary feeds can wait on network failures concurrently.
+        # Keep fallbacks and all result mutation in the assembling thread.
+        actions = {
+            "quote": self.tencent_quote, "intraday": self.tencent_intraday,
+            "details": self.eastmoney_details, "daily": self.eastmoney_kline,
+            "precision": self.eastmoney_quote_precision,
+            "benchmark": self.benchmark_daily, "billboard": self.eastmoney_billboard,
+            "exact": self.sina_daily_exact,
+        }
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            pending = {key: pool.submit(action, identity) for key, action in actions.items()}
+            return self._assemble_fetch(identity, pending)
+
+    def _assemble_fetch(self, identity: StockIdentity, pending: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {"identity": asdict(identity), "fetched_at": datetime.now().isoformat(timespec="seconds"), "errors": {}, "sources": {}}
-        for key, action in (("quote", lambda: self.tencent_quote(identity)), ("intraday", lambda: self.tencent_intraday(identity))):
+        for key in ("quote", "intraday"):
             try:
-                result[key] = action()
+                result[key] = pending[key].result()
                 result["sources"][key] = "Tencent"
             except SpiderError as exc:
                 result[key] = {}
                 result["errors"][key] = str(exc)
         if (result.get("quote") or {}).get("data"):
             try:
-                precise = (self.eastmoney_quote_precision(identity).get("data") or {})
-                for field in ("f48", "f116", "f117"):
-                    if precise.get(field) is not None:
-                        result["quote"]["data"][field] = precise[field]
-                result["sources"]["quote"] = "Tencent realtime + Eastmoney exact-yuan market cap"
+                precise = (pending["precision"].result().get("data") or {})
+                if merge_quote_precision(result["quote"]["data"], precise):
+                    result["sources"]["quote"] = "Tencent + Eastmoney matched-date/volume precision"
+                else:
+                    result["sources"]["quote_precision_note"] = "东方财富快照未通过日期/价格/成交量对齐，保留腾讯原始快照"
             except SpiderError as exc:
                 result["errors"]["eastmoney_market_cap"] = str(exc)
         try:
-            result["details"] = self.eastmoney_details(identity)
+            result["details"] = pending["details"].result()
             result["sources"]["details"] = "Eastmoney f1 full-day detail"
         except SpiderError as exc:
             result["errors"]["eastmoney_detail"] = str(exc)
@@ -576,7 +706,7 @@ class Client:
                 result["details"] = {}
                 result["errors"]["details"] = str(fallback_exc)
         try:
-            result["daily"] = self.eastmoney_kline(identity)
+            result["daily"] = pending["daily"].result()
             result["sources"]["daily"] = "Eastmoney forward-adjusted daily"
         except SpiderError as exc:
             result["errors"]["eastmoney_daily"] = str(exc)
@@ -598,8 +728,7 @@ class Client:
         # exact amount are never overwritten.
         if (result.get("daily") or {}).get("data") and not (result.get("daily") or {}).get("meta", {}).get("raw_by_date"):
             try:
-                companion = self.tencent_daily(identity)
-                raw_map = (companion.get("meta") or {}).get("raw_by_date") or {}
+                raw_map = self.tencent_raw_daily(identity)
                 result["daily"].setdefault("meta", {})["raw_by_date"] = raw_map
                 if raw_map:
                     result["sources"]["raw_daily"] = "Tencent unadjusted daily companion"
@@ -607,13 +736,13 @@ class Client:
                 result["errors"]["raw_daily"] = str(exc)
         if (result.get("daily") or {}).get("data"):
             try:
-                exact_daily = self.sina_daily_exact(identity)
+                exact_daily = pending["exact"].result()
                 result["daily"].setdefault("meta", {})["exact_by_date"] = exact_daily
                 result["sources"]["daily_amount_turnover"] = "Sina exact daily amount + historical outstanding shares"
             except SpiderError as exc:
                 result["errors"]["exact_daily_amount_turnover"] = str(exc)
         try:
-            benchmark_name, benchmark_payload = self.benchmark_daily(identity)
+            benchmark_name, benchmark_payload = pending["benchmark"].result()
             result["benchmark_name"] = benchmark_name
             result["benchmark_daily"] = benchmark_payload
             result["sources"]["benchmark"] = "Tencent forward-adjusted index daily"
@@ -621,7 +750,7 @@ class Client:
             result["benchmark_daily"] = {}
             result["errors"]["benchmark"] = str(exc)
         try:
-            result["billboard"] = self.eastmoney_billboard(identity)
+            result["billboard"] = pending["billboard"].result()
             result["sources"]["billboard"] = "Eastmoney"
         except SpiderError as exc:
             result["billboard"] = {}
@@ -630,7 +759,16 @@ class Client:
         result.setdefault("billboard", {})
         if not any(result.get(k, {}).get("data") or result.get(k, {}).get("result") for k in ("quote", "intraday", "daily", "details", "billboard")):
             raise SpiderError("\u6240\u6709\u6570\u636e\u63a5\u53e3\u5747\u5931\u8d25")
+        result["fetched_at"] = datetime.now().isoformat(timespec="seconds")
         normalized = normalize(result)
+        quote_date = market_date((normalized.get("quote") or {}).get("行情时间"))
+        daily_source_date = max((str(row.get("日期") or "") for row in normalized["daily"]), default="")
+        history_aligned = bool(quote_date and daily_source_date == quote_date)
+        normalized["history_sync"] = {"quote_date": quote_date, "daily_source_date": daily_source_date,
+                                      "status": "aligned" if history_aligned else "pending" if quote_date else "unavailable",
+                                      "note": "只有主日线源已经包含行情交易日，才使用实时价格同步该日；不把新不复权价格追加到未重新复权的旧历史。"}
+        if quote_date and not history_aligned:
+            normalized.setdefault("errors", {})["daily_adjustment_sync"] = f"行情日期 {quote_date}，主日线源截止 {daily_source_date or '未获取'}；保留原历史，等待复权序列同步。"
         sync_current_daily(normalized)
         all_daily = normalized["daily"]
         normalized["daily_history"] = all_daily
@@ -649,9 +787,11 @@ class Client:
             ("\u80a1\u7968\u540d\u79f0\u89e3\u6790", lambda: identity),
             ("\u817e\u8baf\u5b9e\u65f6\u884c\u60c5", lambda: self.tencent_quote(identity)),
             ("\u817e\u8baf\u5206\u65f6\u6570\u636e", lambda: self.tencent_intraday(identity)),
-            ("Yahoo \u65e5\u7ebf\u6570\u636e", lambda: self.yahoo_daily(identity)),
-            ("\u4e1c\u8d22\u9010\u7b14\u660e\u7ec6", lambda: self.eastmoney_endpoint(identity, "details")),
-            ("\u4e1c\u8d22\u9f99\u864e\u699c", lambda: self.eastmoney_endpoint(identity, "billboard")),
+            ("东方财富主日线", lambda: self.eastmoney_kline(identity)),
+            ("腾讯备用日线", lambda: self.tencent_daily(identity)),
+            ("新浪历史成交额/股本", lambda: self.sina_daily_exact(identity)),
+            ("\u4e1c\u8d22\u9010\u7b14\u660e\u7ec6", lambda: self.eastmoney_details(identity)),
+            ("\u4e1c\u8d22\u9f99\u864e\u699c", lambda: self.eastmoney_billboard(identity)),
             ("\u5de8\u6f6e\u80a1\u7968\u4ee3\u7801\u8868", lambda: self.json("https://www.cninfo.com.cn/new/data/szse_stock.json")),
         ]
         report = []
@@ -673,7 +813,7 @@ class Client:
             benchmark = StockIdentity("000001", "sh", "1.000001", "上证指数")
         else:
             benchmark = StockIdentity("399001", "sz", "0.399001", "深证成指")
-        return benchmark.name, self.tencent_daily(benchmark)
+        return benchmark.name, self.tencent_daily(benchmark, include_raw=False)
 
 
 def split_rows(raw: list[str], columns: list[str]) -> list[dict[str, Any]]:
@@ -703,7 +843,7 @@ def clock_value(value: Any) -> int | None:
         return None
 
 
-def detail_trading_phase(value: Any) -> tuple[str, str, int]:
+def detail_trading_phase(value: Any, detail_format: str = "") -> tuple[str, str, int]:
     """Classify f1 records so indicative auction snapshots are not summed as trades."""
     tick = clock_value(value)
     if tick is None:
@@ -716,7 +856,13 @@ def detail_trading_phase(value: Any) -> tuple[str, str, int]:
         return "连续竞价", "成交记录", 1
     if 145700 <= tick <= 150000:
         return "收盘集合竞价", "成交记录", 1
-    if 150000 < tick <= 153000:
+    if detail_format == "tencent" and 150000 < tick <= 150003:
+        # The three-second feed can publish the closing auction at 15:00:01.
+        # This is a provider timestamp tolerance, not an extension of market hours.
+        return "收盘集合竞价（腾讯汇总时间）", "成交记录", 1
+    if 150000 < tick < 150500:
+        return "收盘后阶段待确认", "成交记录", 0
+    if 150500 <= tick <= 153000:
         return "盘后定价交易", "成交记录", 0
     return "非交易时段", "未知", 0
 
@@ -731,18 +877,26 @@ def intraday_trading_phase(value: Any) -> tuple[str, int]:
         return "连续竞价", 1
     if 145700 <= tick <= 150000:
         return "收盘集合竞价", 1
-    if 150000 < tick <= 153000:
+    if 150000 < tick < 150500:
+        return "收盘后阶段待确认", 0
+    if 150500 <= tick <= 153000:
         return "盘后定价交易", 0
     return "非交易时段", 0
 
 
 def sync_current_daily(result: dict[str, Any]) -> None:
     """Make today's daily row agree with the real-time quote snapshot."""
+    if result.get("history_sync") and result["history_sync"].get("status") != "aligned":
+        return
     quote = result.get("quote") or {}
-    stamp = re.sub(r"\D", "", str(quote.get("行情时间") or ""))
-    if len(stamp) < 8 or num(quote.get("最新价")) is None:
+    stamp = market_timestamp(quote.get("行情时间"))
+    if len(stamp) < 8 or num(quote.get("最新价")) is None or num(quote.get("最新价")) <= 0:
         return
     trade_date = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"
+    existing_history = result.get("daily_history") or result.get("daily") or []
+    latest_date = max((str(item.get("日期") or "") for item in existing_history), default="")
+    if trade_date < latest_date:
+        return
     row = {
         "日期": trade_date,
         "开盘": num(quote.get("今开")),
@@ -759,6 +913,13 @@ def sync_current_daily(result: dict[str, Any]) -> None:
         "复权口径": "前复权；当日因子=1",
         "成交额口径": "实时行情精确值",
     }
+    row = {key: value for key, value in row.items() if value is not None}
+    if num(quote.get("换手率(%)")) is not None:
+        row["历史行情换手率(%)"] = num(quote["换手率(%)"])
+        row["可用历史换手率(%)"] = num(quote["换手率(%)"])
+        row["可用历史换手率口径"] = "当前行情商显示值（可能四舍五入）"
+    if "成交额" not in row:
+        row.pop("成交额口径", None)
     stamp_time = int(stamp[8:14] or 0) if len(stamp) >= 14 else 0
     row["数据状态"] = "盘中" if stamp_time < 150000 else "收盘"
     targets = [result.setdefault("daily", [])]
@@ -768,11 +929,17 @@ def sync_current_daily(result: dict[str, Any]) -> None:
     for daily in targets:
         for current in daily:
             if current.get("日期") == trade_date:
+                historical_shares = num(current.get("历史流通股本(股)"))
+                if historical_shares and row.get("数据状态") == "盘中" and "成交量" in row and num(current.get("成交量")) != row["成交量"]:
+                    current["精确历史换手率(%)"] = row["成交量"] * 100 / historical_shares * 100
+                    current["精确历史换手率口径"] = "兼容字段名；当前主交易成交量÷历史流通股本计算值"
                 current.update(row)
                 break
         else:
             daily.append(dict(row))
             daily.sort(key=lambda item: str(item.get("日期") or ""))
+    if isinstance(history, list) and history is not targets[0]:
+        result["daily"] = history[-60:]
 
 
 def rolling_mean(values: list[float | None], period: int) -> list[float | None]:
@@ -879,11 +1046,12 @@ def enrich_daily_indicators(rows: list[dict[str, Any]], identity: dict[str, Any]
 
     rsi6: list[float | None] = []
     rsi12: list[float | None] = []
-    gains: list[float] = [0.0]
-    losses: list[float] = [0.0]
+    gains: list[float | None] = [None] if closes else []
+    losses: list[float | None] = [None] if closes else []
     for i in range(1, len(closes)):
-        change = (closes[i] - closes[i - 1]) if closes[i] is not None and closes[i - 1] is not None else 0
-        gains.append(max(change, 0)); losses.append(max(-change, 0))
+        change = (closes[i] - closes[i - 1]) if closes[i] is not None and closes[i - 1] is not None else None
+        gains.append(max(change, 0) if change is not None else None)
+        losses.append(max(-change, 0) if change is not None else None)
     for period, target in ((6, rsi6), (12, rsi12)):
         avg_gain, avg_loss = wilder_average(gains, period), wilder_average(losses, period)
         for gain, loss in zip(avg_gain, avg_loss):
@@ -942,7 +1110,7 @@ def enrich_daily_indicators(rows: list[dict[str, Any]], identity: dict[str, Any]
         row["可用成交额口径"] = "接口精确值" if exact_turnover is not None else "典型价×成交量×100估算"
         row["估算换手率_按当前流通股本(%)"] = volumes[i] * 100 / current_float_shares * 100 if volumes[i] is not None and current_float_shares else None
         row["流通股本估算(股)"] = current_float_shares
-        row["行情显示换手率(%)"] = num((quote or {}).get("换手率(%)")) if i == len(enriched) - 1 else None
+        row["行情显示换手率(%)"] = num((quote or {}).get("换手率(%)")) if market_date((quote or {}).get("行情时间")) == row.get("日期") else None
         raw_previous = num(rows[i - 1].get("不复权收盘")) if i else None
         raw_high = num(rows[i].get("不复权最高"))
         raw_low = num(rows[i].get("不复权最低"))
@@ -966,9 +1134,11 @@ def build_analysis(result: dict[str, Any]) -> dict[str, Any]:
     latest = daily[-1] if daily else {}
     closes = [num(row.get("收盘")) for row in daily]
     volumes = [num(row.get("成交量")) for row in daily]
+    dates = [market_date(row.get("日期")) for row in daily]
+    sequence_ok = bool(dates) and all(dates) and all(a < b for a, b in zip(dates, dates[1:]))
 
     def period_return(days: int) -> float | None:
-        if len(closes) <= days or closes[-1] is None or not closes[-days - 1]:
+        if not sequence_ok or len(closes) <= days or any(value is None or value <= 0 for value in closes[-days - 1:]):
             return None
         return (closes[-1] / closes[-days - 1] - 1) * 100
 
@@ -977,19 +1147,19 @@ def build_analysis(result: dict[str, Any]) -> dict[str, Any]:
     aligned = [(num(row.get("收盘")), benchmark_by_date.get(row.get("日期"))) for row in daily]
     relative: dict[str, float | None] = {}
     for days in (20, 60, 120, 250):
-        usable = [(stock, index) for stock, index in aligned if stock is not None and index is not None]
-        if len(usable) > days and usable[-days - 1][0] and usable[-days - 1][1]:
-            stock_return = (usable[-1][0] / usable[-days - 1][0] - 1) * 100
-            benchmark_return = (usable[-1][1] / usable[-days - 1][1] - 1) * 100
+        if sequence_ok and len(aligned) > days and all(value is not None and value > 0 for pair in aligned[-days - 1:] for value in pair):
+            stock_return = (aligned[-1][0] / aligned[-days - 1][0] - 1) * 100
+            benchmark_return = (aligned[-1][1] / aligned[-days - 1][1] - 1) * 100
             relative[f"{days}日"] = stock_return - benchmark_return
         else:
             relative[f"{days}日"] = None
 
-    returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i] and closes[i - 1]]
-    recent_returns = returns[-20:]
-    volatility = math.sqrt(sum((value - sum(recent_returns) / len(recent_returns)) ** 2 for value in recent_returns) / len(recent_returns)) * math.sqrt(250) * 100 if recent_returns else None
+    valid_risk_window = sequence_ok and len(closes) >= 21 and all(value is not None and value > 0 for value in closes[-21:])
+    recent_returns = [math.log(b / a) for a, b in zip(closes[-21:-1], closes[-20:])] if valid_risk_window else []
+    volatility = math.sqrt(sum((value - sum(recent_returns) / len(recent_returns)) ** 2 for value in recent_returns) / len(recent_returns)) * math.sqrt(250) * 100 if len(recent_returns) >= 2 else None
     peak = None; max_drawdown = 0.0
-    for close in [value for value in closes[-120:] if value is not None]:
+    valid_drawdown = sequence_ok and len(closes) >= 2 and all(value is not None and value > 0 for value in closes[-120:])
+    for close in closes[-120:] if valid_drawdown else []:
         peak = close if peak is None else max(peak, close)
         if peak:
             max_drawdown = min(max_drawdown, close / peak - 1)
@@ -1001,7 +1171,7 @@ def build_analysis(result: dict[str, Any]) -> dict[str, Any]:
     elif close is not None and ma5 and ma10 and ma20 and close < ma5 < ma10 < ma20:
         trend = "短期空头排列"
     elif close is not None and ma20:
-        trend = "价格位于MA20上方" if close > ma20 else "价格位于MA20下方"
+        trend = "价格位于MA20上方" if close > ma20 else "价格位于MA20下方" if close < ma20 else "价格接近MA20"
     else:
         trend = "历史数据不足"
     high20 = max((num(row.get("最高")) for row in daily[-20:] if num(row.get("最高")) is not None), default=None)
@@ -1012,9 +1182,11 @@ def build_analysis(result: dict[str, Any]) -> dict[str, Any]:
     after_intraday = [row for row in intraday if row.get("交易阶段") == "盘后定价交易"]
 
     def minute_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        volume = sum(num(row.get("成交量"), 0) or 0 for row in rows)
-        turnover = sum(num(row.get("成交额"), 0) or 0 for row in rows)
-        return {"记录数": len(rows), "成交量(手)": volume, "成交额": turnover, "VWAP": turnover / (volume * 100) if volume else None}
+        complete_volumes = bool(rows) and all(num(row.get("成交量")) is not None and num(row.get("成交量")) >= 0 for row in rows)
+        volume = sum(num(row.get("成交量")) for row in rows) if complete_volumes else None
+        complete_amounts = bool(rows) and all(num(row.get("成交额")) is not None and num(row.get("成交额")) >= 0 for row in rows)
+        turnover = sum(num(row.get("成交额"), 0) or 0 for row in rows) if complete_amounts else None
+        return {"记录数": len(rows), "成交量(手)": volume, "成交额": turnover, "VWAP": turnover / (volume * 100) if turnover is not None and volume else None}
 
     main_minute = minute_summary(main_intraday)
     after_minute = minute_summary(after_intraday)
@@ -1032,19 +1204,22 @@ def build_analysis(result: dict[str, Any]) -> dict[str, Any]:
         if side in side_volume:
             side_volume[side] += num(row.get("成交量"), 0) or 0
     active_total = side_volume["买盘"] + side_volume["卖盘"]
-    main_detail_volume = sum(num(row.get("成交量"), 0) or 0 for row in main_details)
-    after_detail_volume = sum(num(row.get("成交量"), 0) or 0 for row in after_details)
+    main_volume_ready = bool(main_details) and all(num(row.get("成交量")) is not None and num(row.get("成交量")) >= 0 for row in main_details)
+    after_volume_ready = bool(after_details) and all(num(row.get("成交量")) is not None and num(row.get("成交量")) >= 0 for row in after_details)
+    direction_ready = main_volume_ready and all(row.get("方向") in side_volume for row in main_details)
+    main_detail_volume = sum(num(row.get("成交量")) for row in main_details) if main_volume_ready else None
+    after_detail_volume = sum(num(row.get("成交量")) for row in after_details) if after_volume_ready else None
     return {
         "趋势判断": trend,
         "阶段收益(%)": {"5日": period_return(5), "10日": period_return(10), "20日": period_return(20), "60日": period_return(60), "120日": period_return(120), "250日": period_return(250)},
-        "相对强弱": {"基准": result.get("benchmark_name") or "未获取", "超额收益(百分点)": relative},
+        "相对强弱": {"基准": result.get("benchmark_name") or "未获取", "截止日期": latest.get("日期"), "超额收益(百分点)": relative},
         "均线": {"MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60, "MA120": num(latest.get("MA120")), "MA250": num(latest.get("MA250"))},
         "动量指标": {"DIF": num(latest.get("DIF")), "DEA": num(latest.get("DEA")), "MACD": num(latest.get("MACD")), "RSI6": num(latest.get("RSI6")), "RSI12": num(latest.get("RSI12")), "K": num(latest.get("K")), "D": num(latest.get("D")), "J": num(latest.get("J"))},
-        "波动风险": {"ATR14": num(latest.get("ATR14")), "20日年化波动率(%)": volatility, "近120日最大回撤(%)": max_drawdown * 100, "20日最高": high20, "20日最低": low20},
+        "波动风险": {"ATR14": num(latest.get("ATR14")), "20日年化波动率(%)": volatility, "近120日最大回撤(%)": max_drawdown * 100 if valid_drawdown else None, "20日最高": high20, "20日最低": low20},
         "量价": {"当日量比_MA5": num(latest.get("量比_MA5")), "5日均量(手)": num(latest.get("VOL_MA5")), "10日均量(手)": num(latest.get("VOL_MA10")), "OBV": num(latest.get("OBV")), "当日成交量(手)": volumes[-1] if volumes else None},
         "分时": {"主交易VWAP": intraday_vwap, "最新价相对主交易VWAP(%)": ((current_price / intraday_vwap) - 1) * 100 if current_price and intraday_vwap else None, "主交易": main_minute, "盘后定价": after_minute, "接口全时段": full_minute},
-        "主动成交": {"统计口径": "仅开盘集合竞价成交、连续竞价及收盘集合竞价；排除竞价快照和盘后定价", "主交易记录数": len(main_details), "主交易成交量(手)": main_detail_volume, "买盘量(手)": side_volume["买盘"], "卖盘量(手)": side_volume["卖盘"], "中性量(手)": side_volume["中性"], "买盘占主动成交(%)": side_volume["买盘"] / active_total * 100 if active_total else None, "净主动量(手)": side_volume["买盘"] - side_volume["卖盘"], "竞价快照记录数": len(auction_snapshots), "盘后定价记录数": len(after_details), "盘后定价成交量(手)": after_detail_volume},
-        "数据限制": ["历史精确成交额、历史流通股本和据此计算的历史换手率已接入；估算列仅作为精确源失败时的备用", "不同行情商可能因无限售流通股本生效日、盘后交易计入口径和四舍五入而出现细微换手率差异", "理论涨跌停价按当前板块/名称规则推算，IPO无涨跌幅期和历史ST状态需要交易所日历或证券状态库复核", "仅有宽基指数比较，所属行业指数和同业横向排名仍未接入", "逐笔买卖方向按数据源规则分类，不等同于交易所认定的真实主动买卖", "财务、估值、公告、新闻、资金流和融资融券属于另一类低频/事件数据，当前仍未接入", "盘中日K和技术指标会随实时行情变化，不是最终收盘值"],
+        "主动成交": {"统计口径": "仅开盘集合竞价成交、连续竞价及收盘集合竞价；排除竞价快照和盘后定价；仅描述已取回记录，完整性另见质量检查", "主交易记录数": len(main_details), "主交易成交量(手)": main_detail_volume, "买盘量(手)": side_volume["买盘"] if direction_ready else None, "卖盘量(手)": side_volume["卖盘"] if direction_ready else None, "中性量(手)": side_volume["中性"] if direction_ready else None, "买盘占主动成交(%)": side_volume["买盘"] / active_total * 100 if direction_ready and active_total else None, "净主动量(手)": side_volume["买盘"] - side_volume["卖盘"] if direction_ready else None, "竞价快照记录数": len(auction_snapshots), "盘后定价记录数": len(after_details), "盘后定价成交量(手)": after_detail_volume},
+        "数据限制": [f"历史接口成交额覆盖 {sum(num(row.get('成交额')) is not None for row in daily)}/{len(daily)} 行，历史流通股本覆盖 {sum(num(row.get('历史流通股本(股)')) is not None for row in daily)}/{len(daily)} 行；缺失不视为已取得", "历史股本口径换手率是计算值，不保证交易所精度；与行情商显示值分列，差异可能来自股本生效日、交易口径和四舍五入", "理论涨跌停价按当前板块/名称规则推算，IPO无涨跌幅期和历史ST状态需要交易所日历或证券状态库复核", "仅有宽基指数比较，所属行业指数和同业横向排名仍未接入", "逐笔买卖方向按数据源规则分类，不等同于交易所认定的真实主动买卖；备用汇总数据不能冒充交易所原始逐笔", "财务、估值、公告、新闻、资金流和融资融券属于另一类低频/事件数据，当前仍未接入", "盘中日K和技术指标会随实时行情变化，不是最终收盘值"],
     }
 
 
@@ -1054,6 +1229,11 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
     if q.get("f58"):
         identity["name"] = q["f58"]
     quote = {"\u4ee3\u7801": q.get("f57", identity["code"]), "\u540d\u79f0": q.get("f58", identity.get("name", "")), "\u6700\u65b0\u4ef7": q.get("f43"), "昨收": q.get("f60"), "\u6da8\u8dcc\u5e45(%)": q.get("f169"), "\u6210\u4ea4\u989d": q.get("f48"), "\u6210\u4ea4\u91cf(\u624b)": q.get("f47"), "\u6362\u624b\u7387(%)": q.get("f168"), "\u603b\u5e02\u503c": q.get("f116"), "\u6d41\u901a\u5e02\u503c": q.get("f117"), "\u4eca\u5f00": q.get("f46"), "\u6700\u9ad8": q.get("f44"), "\u6700\u4f4e": q.get("f45"), "行情时间": q.get("f86")}
+    for key in quote:
+        if key not in {"代码", "名称", "行情时间"}:
+            quote[key] = num(quote[key])
+    quote["行情时间"] = market_timestamp(quote.get("行情时间")) or None
+    quote_date = market_date(quote.get("行情时间"))
     quote["涨跌额"] = (num(quote.get("最新价")) - num(quote.get("昨收"))) if num(quote.get("最新价")) is not None and num(quote.get("昨收")) is not None else None
     intraday = []
     for row in split_rows((raw.get("intraday", {}).get("data") or {}).get("trends", []), ["\u65f6\u95f4", "\u4ef7\u683c", "\u6da8\u8dcc", "\u6210\u4ea4\u91cf", "\u6210\u4ea4\u989d"]):
@@ -1062,12 +1242,18 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
         phase, main_session = intraday_trading_phase(row.get("时间"))
         row["交易阶段"] = phase
         row["计入主交易统计"] = main_session
+        row["交易日期"] = (raw.get("intraday", {}).get("meta") or {}).get("trade_date") or ""
         intraday.append(row)
     daily = []
     raw_by_date = (raw.get("daily", {}).get("meta") or {}).get("raw_by_date") or {}
     exact_by_date = (raw.get("daily", {}).get("meta") or {}).get("exact_by_date") or {}
     daily_adjustment = (raw.get("daily", {}).get("meta") or {}).get("adjustment") or "qfq"
-    for row in split_rows((raw.get("daily", {}).get("data") or {}).get("klines", []), ["\u65e5\u671f", "\u5f00\u76d8", "\u6536\u76d8", "\u6700\u9ad8", "\u6700\u4f4e", "\u6210\u4ea4\u91cf", "\u6210\u4ea4\u989d"]):
+    daily_lines = []
+    for line in (raw.get("daily", {}).get("data") or {}).get("klines", []):
+        if isinstance(line, str) and len(line.split(",")) == 7:
+            line += ","
+        daily_lines.append(line)
+    for row in split_rows(daily_lines, ["\u65e5\u671f", "\u5f00\u76d8", "\u6536\u76d8", "\u6700\u9ad8", "\u6700\u4f4e", "\u6210\u4ea4\u91cf", "\u6210\u4ea4\u989d", "历史行情换手率(%)"]):
         for key in list(row)[1:]:
             row[key] = num(row[key])
         companion = raw_by_date.get(str(row.get("日期") or "")) or {}
@@ -1086,16 +1272,22 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
         qfq_close = num(row.get("收盘"))
         row["前复权因子"] = qfq_close / raw_close if qfq_close is not None and raw_close else None
         exact_amount = num(exact.get("精确成交额"))
-        if exact_amount is not None:
+        row["新浪成交额"] = exact_amount
+        row["成交额跨源差值"] = num(row.get("成交额")) - exact_amount if num(row.get("成交额")) is not None and exact_amount is not None else None
+        if exact_amount is not None and num(row.get("成交额")) is None:
             row["成交额"] = exact_amount
             row["成交额口径"] = "新浪原始日线精确值（元）"
         row["历史流通股本(股)"] = num(exact.get("历史流通股本(股)"))
+        row["历史股本口径成交量(股)"] = num(exact.get("新浪成交量(股)"))
         row["精确历史换手率(%)"] = num(exact.get("精确历史换手率(%)"))
         row["盘后成交量(股)"] = num(exact.get("盘后成交量(股)"))
         row["盘后成交额"] = num(exact.get("盘后成交额"))
         row["精确历史字段来源"] = exact.get("精确历史字段来源") or ""
+        row["历史股本获取说明"] = exact.get("历史股本获取说明") or ""
         if exact:
-            row["精确历史换手率口径"] = "成交量(股)÷当日匹配的历史流通股本×100%；与行情商展示口径分列"
+            row["精确历史换手率口径"] = "兼容字段名；历史股本口径计算值，并非交易所验证值；与行情商展示口径分列"
+        row["可用历史换手率(%)"] = num(row.get("历史行情换手率(%)"), num(row.get("精确历史换手率(%)")))
+        row["可用历史换手率口径"] = "东方财富日线显示值（可能四舍五入）" if num(row.get("历史行情换手率(%)")) is not None else "新浪历史流通股本口径计算值" if num(row.get("精确历史换手率(%)")) is not None else "未获取"
         daily.append(row)
     benchmark = []
     for row in split_rows((raw.get("benchmark_daily", {}).get("data") or {}).get("klines", []), ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]):
@@ -1109,110 +1301,63 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
         if len(p) >= 6:
             # Eastmoney push2: time, price, volume, trades/flag, direction, ...
             # It does not contain exact turnover, so do not invent one.
-            phase, nature, main_session = detail_trading_phase(p[0])
+            phase, nature, main_session = detail_trading_phase(p[0], detail_format)
             price, volume = num(p[1]), num(p[2])
             details.append({"序号": sequence, "\u65f6\u95f4": p[0], "\u4ef7\u683c": price, "\u6210\u4ea4\u91cf": volume, "\u65b9\u5411": direction_name(p[4]), "\u91d1\u989d": None, "估算金额": price * volume * 100 if price is not None and volume is not None and nature == "成交记录" else None, "金额口径": "价格×成交量×100估算；非接口精确金额" if nature == "成交记录" else "非成交记录", "成交笔数/标记": num(p[3]), "交易阶段": phase, "记录性质": nature, "计入主交易统计": main_session})
         elif len(p) >= 5:
             if detail_format == "eastmoney":
                 # Eastmoney webguest: time, price, volume, trades/flag, direction.
                 volume = num(p[2])
-                price = num(p[1]); phase, nature, main_session = detail_trading_phase(p[0])
+                price = num(p[1]); phase, nature, main_session = detail_trading_phase(p[0], detail_format)
                 details.append({"序号": sequence, "\u65f6\u95f4": p[0], "\u4ef7\u683c": price, "\u6210\u4ea4\u91cf": volume, "\u65b9\u5411": direction_name(p[4]), "\u91d1\u989d": None, "估算金额": price * volume * 100 if price is not None and volume is not None and nature == "成交记录" else None, "金额口径": "价格×成交量×100估算；非接口精确金额" if nature == "成交记录" else "非成交记录", "成交笔数/标记": num(p[3]), "交易阶段": phase, "记录性质": nature, "计入主交易统计": main_session})
             else:
                 # 腾讯备用格式：时间、价格、成交量、方向、成交额。
-                price, volume = num(p[1]), num(p[2]); phase, nature, main_session = detail_trading_phase(p[0])
+                price, volume = num(p[1]), num(p[2]); phase, nature, main_session = detail_trading_phase(p[0], detail_format)
                 details.append({"序号": sequence, "\u65f6\u95f4": p[0], "\u4ef7\u683c": price, "\u6210\u4ea4\u91cf": volume, "\u65b9\u5411": direction_name(p[3]), "\u91d1\u989d": num(p[4]), "估算金额": price * volume * 100 if price is not None and volume is not None else None, "金额口径": "腾讯3秒汇总接口值", "成交笔数/标记": None, "交易阶段": phase, "记录性质": nature, "计入主交易统计": main_session})
     billboard = []
     for row in ((raw.get("billboard", {}).get("result") or {}).get("data") or []):
         billboard.append({"\u4ea4\u6613\u65e5\u671f": str(row.get("TRADE_DATE", ""))[:10], "\u4e0a\u699c\u539f\u56e0": row.get("EXPLANATION") or row.get("EXPLAIN") or "", "\u6536\u76d8\u4ef7": row.get("CLOSE_PRICE"), "\u6da8\u8dcc\u5e45(%)": row.get("CHANGE_RATE"), "\u6362\u624b\u7387(%)": row.get("TURNOVERRATE"), "\u4e70\u5165\u989d": row.get("BILLBOARD_BUY_AMT"), "\u5356\u51fa\u989d": row.get("BILLBOARD_SELL_AMT"), "\u51c0\u4e70\u5165\u989d": row.get("BILLBOARD_NET_AMT"), "\u540e1\u65e5\u6da8\u8dcc(%)": row.get("D1_CLOSE_ADJCHRATE")})
     detail_meta = dict(raw.get("details", {}).get("meta") or {})
     fetched_at = datetime.fromisoformat(raw["fetched_at"])
-    final_cutoff_reached = fetched_at.time() >= datetime.strptime("15:30:00", "%H:%M:%S").time()
-    interface_complete = bool(detail_meta.get("complete") or detail_meta.get("coverage_complete"))
+    stamp = market_timestamp(quote.get("行情时间"))
+    final_cutoff_reached = len(stamp) == 14 and int(stamp[8:]) >= 153000
+    interface_complete = bool(details and detail_meta.get("complete") and detail_meta.get("format") == "eastmoney")
+    main_volume = sum(num(row.get("成交量"), 0) or 0 for row in details if row.get("计入主交易统计") == 1 and row.get("记录性质") == "成交记录")
+    quote_volume = num(quote.get("成交量(手)"))
+    difference = main_volume - quote_volume if quote_volume is not None else None
+    volume_reconciled = difference is not None and abs(difference) < 0.001 and bool(details)
+    minute_date = (raw.get("intraday", {}).get("meta") or {}).get("trade_date") or ""
+    date_mismatch = bool(minute_date and quote_date and minute_date != quote_date)
     detail_meta["interface_complete"] = interface_complete
-    detail_meta["final_complete"] = bool(interface_complete and final_cutoff_reached)
-    detail_meta["completeness_note"] = ("收盘后最终全量" if detail_meta["final_complete"] else "截至采集时刻的接口全量；盘后定价尚可能增加") if interface_complete else "备用数据或序号覆盖不完整"
+    detail_meta["volume_reconciled"] = volume_reconciled
+    detail_meta["main_volume_difference_lots"] = difference
+    detail_meta["trade_date"] = quote_date
+    detail_meta["date_basis"] = "根据行情日期推定；明细接口未提供逐条日期"
+    detail_meta["date_mismatch"] = date_mismatch
+    detail_meta["final_complete"] = bool(interface_complete and final_cutoff_reached and volume_reconciled and not date_mismatch)
+    if not interface_complete:
+        note = "备用汇总数据或接口覆盖不完整；不能标记为原始逐笔全量"
+        if detail_meta.get("network_interrupted"):
+            note += "；后续分页持续断网，已停止本次请求并保留已取回部分"
+        elif detail_meta.get("page_limit_reached"):
+            note += "；达到分页保护上限，尚未确认尾页"
+    elif date_mismatch:
+        note = "分时与行情交易日期不一致，不能确认明细完整性"
+    elif not volume_reconciled:
+        note = f"接口全量已取回，主交易量与行情相差{difference:g}手；可能存在舍入、时间差或缺失，未验证最终完整性" if difference is not None else "接口全量已取回，但缺少行情成交量用于核验"
+    else:
+        note = "收盘后接口全量，主交易量核对一致（非交易所原始逐笔保证）" if detail_meta["final_complete"] else "截至采集时刻接口全量，主交易量核对一致；后续仍可能增加"
+    detail_meta["completeness_note"] = note
     detail_meta["main_trade_rows"] = sum(row.get("计入主交易统计") == 1 for row in details)
     detail_meta["auction_snapshot_rows"] = sum(row.get("记录性质") == "行情快照" for row in details)
     detail_meta["after_hours_rows"] = sum(row.get("交易阶段") == "盘后定价交易" for row in details)
+    for row in details:
+        row["交易日期"] = quote_date
+        row["交易日期口径"] = detail_meta["date_basis"]
     # 逐笔原始序号只用于完整性核对，不改变展示顺序。
     return {"identity": identity, "fetched_at": raw["fetched_at"], "quote": quote, "intraday": intraday, "details": details, "details_meta": detail_meta, "daily": daily, "benchmark_name": raw.get("benchmark_name", ""), "benchmark_history": benchmark, "billboard": billboard, "errors": raw.get("errors", {}), "sources": raw.get("sources", {})}
 
 
-def build_markdown_report(result: dict[str, Any], health: list[dict[str, Any]] | None = None) -> str:
-    identity = result["identity"]
-    quote = result["quote"]
-    daily = result.get("daily", [])
-    latest = daily[-1] if daily else {}
-    first = daily[0] if daily else {}
-    close0, close1 = num(first.get("收盘")), num(latest.get("收盘"))
-    window_change = ((close1 / close0) - 1) * 100 if close0 and close1 else None
-    close20 = num(daily[-21].get("收盘")) if len(daily) >= 21 else None
-    change20 = ((close1 / close20) - 1) * 100 if close1 and close20 else None
-    detail_meta = result.get("details_meta") or {}
-    lines = [
-        f"# {identity.get('name') or '股票'}（{identity.get('code')}）分析报告",
-        "", f"- 生成时间：{result.get('fetched_at', '')}", f"- 市场：{identity.get('market', '').upper()}",
-        f"- 日线来源：{(result.get('sources') or {}).get('daily', '未标记')}",
-        f"- 逐笔来源：{(result.get('sources') or {}).get('details', '未标记')}（{detail_meta.get('completeness_note', '完整性未标记')}）",
-        "", "## 当前行情", "", "| 指标 | 数值 |", "|---|---:|",
-    ]
-    for key in ("最新价", "昨收", "涨跌额", "涨跌幅(%)", "成交额", "成交量(手)", "换手率(%)", "今开", "最高", "最低", "总市值", "流通市值"):
-        value = quote.get(key)
-        lines.append(f"| {key} | {amount(value) if key in {'成交额', '总市值', '流通市值'} else fmt(value) } |")
-    analysis = result.get("analysis") or build_analysis(result)
-    returns = analysis.get("阶段收益(%)") or {}
-    relative = analysis.get("相对强弱") or {}
-    averages = analysis.get("均线") or {}
-    momentum = analysis.get("动量指标") or {}
-    risk = analysis.get("波动风险") or {}
-    volume_price = analysis.get("量价") or {}
-    intraday_analysis = analysis.get("分时") or {}
-    active = analysis.get("主动成交") or {}
-    lines += [
-        "", "## 技术走势分析", "",
-        f"- 趋势：{analysis.get('趋势判断', '暂无')}",
-        "- 阶段收益：" + "；".join(f"{key} {fmt(value)}%" for key, value in returns.items()),
-        f"- 相对强弱（基准：{relative.get('基准', '未获取')}）：" + "；".join(f"{key}超额 {fmt(value)} 个百分点" for key, value in (relative.get('超额收益(百分点)') or {}).items()),
-        "- 均线：" + "；".join(f"{key} {fmt(value)}" for key, value in averages.items()),
-        f"- MACD：DIF {fmt(momentum.get('DIF'))}，DEA {fmt(momentum.get('DEA'))}，柱值 {fmt(momentum.get('MACD'))}",
-        f"- RSI：RSI6 {fmt(momentum.get('RSI6'))}，RSI12 {fmt(momentum.get('RSI12'))}",
-        f"- KDJ：K {fmt(momentum.get('K'))}，D {fmt(momentum.get('D'))}，J {fmt(momentum.get('J'))}",
-        f"- 波动风险：ATR14 {fmt(risk.get('ATR14'))}；20日年化波动率 {fmt(risk.get('20日年化波动率(%)'))}%；近120日最大回撤 {fmt(risk.get('近120日最大回撤(%)'))}%",
-        f"- 20日价格区间（不是严格支撑/压力位）：最低 {fmt(risk.get('20日最低'))} / 最高 {fmt(risk.get('20日最高'))}",
-        f"- 量价：当日量比(MA5) {fmt(volume_price.get('当日量比_MA5'))}；5日均量 {fmt(volume_price.get('5日均量(手)'), 0)} 手；OBV {fmt(volume_price.get('OBV'), 0)}",
-        f"- 分时主交易：VWAP {fmt(intraday_analysis.get('主交易VWAP'))}；最新价相对主交易VWAP {fmt(intraday_analysis.get('最新价相对主交易VWAP(%)'))}%",
-        f"- 盘后定价：{fmt((intraday_analysis.get('盘后定价') or {}).get('成交量(手)'), 0)} 手，{(intraday_analysis.get('盘后定价') or {}).get('记录数', 0)} 条分钟时间点（含零增量时间点）",
-        f"- 主交易主动成交：买盘 {fmt(active.get('买盘量(手)'), 0)} 手；卖盘 {fmt(active.get('卖盘量(手)'), 0)} 手；净主动量 {fmt(active.get('净主动量(手)'), 0)} 手；买盘占比 {fmt(active.get('买盘占主动成交(%)'))}%",
-        f"- 已排除：竞价快照 {active.get('竞价快照记录数', 0)} 条；盘后定价逐笔 {active.get('盘后定价记录数', 0)} 条 / {fmt(active.get('盘后定价成交量(手)'), 0)} 手",
-    ]
-    lines += ["", "## 最近60个交易日日线", "", "| 日期 | 开盘 | 收盘 | 最高 | 最低 | 成交量 | 成交额 |", "|---|---:|---:|---:|---:|---:|---:|"]
-    for row in daily:
-        lines.append("| " + " | ".join([str(row.get("日期", "")), fmt(row.get("开盘")), fmt(row.get("收盘")), fmt(row.get("最高")), fmt(row.get("最低")), fmt(row.get("成交量"), 0), amount(row.get("成交额"))]) + " |")
-    completeness = detail_meta.get("completeness_note") or "完整性未标记"
-    lines += ["", "## 走势摘要", "", f"- 最近{len(daily)}个交易日首尾收盘变化：{fmt(window_change)}%" if window_change is not None else f"- 最近{len(daily)}个交易日首尾收盘变化：暂无", f"- 20个交易日收益：{fmt(change20)}%" if change20 is not None else "- 20个交易日收益：暂无", f"- 当日分时记录：{len(result.get('intraday', []))} 条（主交易和盘后定价已分列）", f"- 逐笔接口记录：{len(result.get('details', []))} 条（{completeness}）", f"- 其中主交易成交记录：{detail_meta.get('main_trade_rows', 0)} 条；竞价快照：{detail_meta.get('auction_snapshot_rows', 0)} 条；盘后定价：{detail_meta.get('after_hours_rows', 0)} 条", f"- 龙虎榜近31天记录：{len(result.get('billboard', []))} 条"]
-    closes = [num(row.get("收盘")) for row in daily if num(row.get("收盘")) is not None]
-    highs = [num(row.get("最高")) for row in daily if num(row.get("最高")) is not None]
-    lows = [num(row.get("最低")) for row in daily if num(row.get("最低")) is not None]
-    volumes = [num(row.get("成交量"), 0) or 0 for row in daily]
-    if closes:
-        lines += [f"- 最近{len(daily)}个交易日最高/最低：{fmt(max(highs))} / {fmt(min(lows))}", f"- 最近{len(daily)}个交易日收盘均价：{fmt(sum(closes) / len(closes))}", f"- 最近5日平均成交量：{fmt(sum(volumes[-5:]) / max(1, len(volumes[-5:])), 0)}"]
-        if len(closes) >= 5:
-            trend = "上行" if closes[-1] > closes[-5] else "下行" if closes[-1] < closes[-5] else "横盘"
-            lines.append(f"- 最近5日收盘趋势：{trend}")
-    chips = result.get("chips") or {}
-    lines += ["", "## 估算筹码分布", "", f"- 估算平均成本：{fmt(chips.get('平均成本'))}", f"- 说明：{chips.get('口径', '')}"]
-    peaks = sorted(chips.get("筹码峰", []), key=lambda row: row.get("占比(%)", 0), reverse=True)[:8]
-    if peaks:
-        lines += ["", "| 成本价 | 估算筹码量 | 占比 |", "|---:|---:|---:|"]
-        lines += [f"| {fmt(row['成本价'])} | {fmt(row['估算筹码量'], 0)} | {fmt(row['占比(%)'])}% |" for row in peaks]
-    lines += ["", "## 龙虎榜（最近31天）", "", "| 日期 | 上榜原因 | 买入额 | 卖出额 | 净买入额 |", "|---|---|---:|---:|---:|"]
-    for row in result.get("billboard", []):
-        lines.append(f"| {row.get('交易日期','')} | {row.get('上榜原因','')} | {amount(row.get('买入额'))} | {amount(row.get('卖出额'))} | {amount(row.get('净买入额'))} |")
-    lines += ["", "## 尚未包含的数据", ""]
-    lines += [f"- {item}" for item in analysis.get("数据限制", [])]
-    lines += ["", "> 说明：不同软件可能使用不同数据源、复权方式、成交口径和更新时间；本报告不构成投资建议。"]
-    return "\n".join(lines) + "\n"
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1241,11 +1386,22 @@ def build_trade_summary_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for category, predicate, treatment in definitions:
         selected = [row for row in details if predicate(row)]
+        volumes = [num(row.get("成交量")) for row in selected]
+        cash = [num(row.get("金额")) for row in selected]
+        estimates = [num(row.get("估算金额")) for row in selected]
+        all_volumes = bool(selected) and all(value is not None and value >= 0 for value in volumes)
+        all_cash = bool(selected) and all(value is not None and value >= 0 for value in cash)
+        all_estimates = bool(selected) and all(value is not None and value >= 0 for value in estimates)
         rows.append({
             "类别": category, "记录数": len(selected),
-            "成交量/快照量(手)": sum(num(row.get("成交量"), 0) or 0 for row in selected),
-            "接口精确金额": sum(num(row.get("金额"), 0) or 0 for row in selected) if any(num(row.get("金额")) is not None for row in selected) else None,
-            "估算金额": round(sum(num(row.get("估算金额"), 0) or 0 for row in selected), 2) if any(num(row.get("估算金额")) is not None for row in selected) else None,
+            "成交量/快照量(手)": sum(volumes) if all_volumes else None,
+            "接口精确金额": sum(cash) if all_cash else None,
+            "估算金额": round(sum(estimates), 2) if all_estimates else None,
+            "已知成交量/快照量(手)": sum(value for value in volumes if value is not None) if any(value is not None for value in volumes) else None,
+            "已知接口金额": sum(value for value in cash if value is not None) if any(value is not None for value in cash) else None,
+            "成交量覆盖": f"{sum(value is not None for value in volumes)}/{len(selected)}",
+            "接口金额覆盖": f"{sum(value is not None for value in cash)}/{len(selected)}",
+            "汇总口径": "整类合计仅在各行字段齐全且非负时提供；已知合计不代表全类合计",
             "统计处理": treatment,
         })
     return rows
@@ -1255,7 +1411,7 @@ def build_data_quality_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     daily = result.get("daily_indicators") or []
     details = result.get("details") or []
     meta = result.get("details_meta") or {}
-    raw_count = sum(num(row.get("不复权收盘")) is not None for row in daily)
+    raw_count = sum(all(num(row.get(key)) is not None and num(row.get(key)) > 0 for key in ("不复权开盘", "不复权收盘", "不复权最高", "不复权最低")) for row in daily)
     exact_daily_amount = sum(num(row.get("成交额")) is not None for row in daily)
     exact_turnover_count = sum(num(row.get("精确历史换手率(%)")) is not None for row in daily)
     exact_share_count = sum(num(row.get("历史流通股本(股)")) is not None for row in daily)
@@ -1267,123 +1423,412 @@ def build_data_quality_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     main_detail_volume = sum(num(row.get("成交量"), 0) or 0 for row in details if row.get("计入主交易统计") == 1 and row.get("记录性质") == "成交记录")
     main_minute_volume = sum(num(row.get("成交量"), 0) or 0 for row in result.get("intraday") or [] if row.get("计入主交易统计") == 1)
     quote_volume = num((result.get("quote") or {}).get("成交量(手)"))
+    source_checks = {row["item"]: row for row in build_quality_checks(result)}
+    def reconciliation_status(item: str) -> str:
+        status = (source_checks.get(item) or {}).get("status")
+        return {"ok": "通过", "warning": "需复核", "error": "异常"}.get(status, "无法核验")
     rows = [
         {"数据项": "前复权日线OHLCV", "状态": "已导出" if daily else "缺失", "覆盖": f"{len(daily)}行", "来源/口径": (result.get("sources") or {}).get("daily", "未标记"), "限制": "当日盘中值会变化"},
         {"数据项": "不复权日线OHLC", "状态": "已导出" if raw_count else "缺失", "覆盖": f"{raw_count}/{len(daily)}行", "来源/口径": (result.get("sources") or {}).get("raw_daily", "Tencent companion or current quote"), "限制": "用于核验复权和涨跌停，不替代前复权技术分析"},
         {"数据项": "前复权因子", "状态": "已计算" if raw_count else "缺失", "覆盖": f"{raw_count}/{len(daily)}行", "来源/口径": "前复权收盘÷不复权收盘", "限制": "价格序列比值，不是公司行动明细表"},
-        {"数据项": "历史精确成交额", "状态": "已导出" if exact_daily_amount == len(daily) else "部分/已导出" if exact_daily_amount else "源未提供", "覆盖": f"{exact_daily_amount}/{len(daily)}行", "来源/口径": "新浪原始日线 amount（元）/当日实时行情", "限制": "按日期与主OHLCV序列合并并对账"},
-        {"数据项": "历史精确换手率", "状态": "已导出" if exact_turnover_count == len(daily) else "部分/已导出" if exact_turnover_count else "源未提供", "覆盖": f"{exact_turnover_count}/{len(daily)}行", "来源/口径": "新浪成交股数÷对应日期历史流通股本×100%", "限制": "与行情商显示值可能因股本生效日、无限售/自由流通口径或四舍五入存在差异"},
-        {"数据项": "最新换手率口径对照", "状态": "已导出", "覆盖": f"历史股本口径{latest_exact_turnover:.4f}% / 行情显示{latest_display_turnover:.4f}%" if latest_exact_turnover is not None and latest_display_turnover is not None else "口径之一缺失", "来源/口径": "历史流通股本计算值 vs 实时行情商显示值", "限制": "两个字段并存，不互相覆盖"},
-        {"数据项": "历史流通股本", "状态": "已导出" if exact_share_count == len(daily) else "部分/已导出", "覆盖": f"{exact_share_count}/{len(daily)}行", "来源/口径": "新浪历史流通股本变更序列前向匹配", "限制": "单位：股"},
+        {"数据项": "历史精确成交额", "状态": "已导出" if daily and exact_daily_amount == len(daily) else "部分/已导出" if exact_daily_amount else "源未提供", "覆盖": f"{exact_daily_amount}/{len(daily)}行", "来源/口径": "东方财富日线优先，新浪原始 amount（元）补缺/当日实时行情", "限制": "接口原始值；跨源差值另列，不互相静默覆盖"},
+        {"数据项": "历史精确换手率", "状态": "已导出" if daily and exact_turnover_count == len(daily) else "部分/已导出" if exact_turnover_count else "源未提供", "覆盖": f"{exact_turnover_count}/{len(daily)}行", "来源/口径": "兼容字段名：新浪成交股数÷对应日期历史流通股本×100%", "限制": "属于历史股本口径计算值，与行情商显示值并列；不保证交易所精度"},
+        {"数据项": "历史行情换手率", "状态": "已导出" if daily and all(num(row.get("历史行情换手率(%)")) is not None for row in daily) else "部分/已导出" if any(num(row.get("历史行情换手率(%)")) is not None for row in daily) else "源未提供", "覆盖": f"{sum(num(row.get('历史行情换手率(%)')) is not None for row in daily)}/{len(daily)}行", "来源/口径": "东方财富日线 f61", "限制": "行情商显示精度，与历史股本计算值并列"},
+        {"数据项": "最新换手率口径对照", "状态": "已导出" if latest_exact_turnover is not None and latest_display_turnover is not None else "口径缺失", "覆盖": f"历史股本口径{latest_exact_turnover:.4f}% / 行情显示{latest_display_turnover:.4f}%" if latest_exact_turnover is not None and latest_display_turnover is not None else "口径之一缺失", "来源/口径": "历史流通股本计算值 vs 实时行情商显示值", "限制": "两个字段并存，不互相覆盖"},
+        {"数据项": "历史流通股本", "状态": "已导出" if daily and exact_share_count == len(daily) else "部分/已导出" if exact_share_count else "源未提供", "覆盖": f"{exact_share_count}/{len(daily)}行", "来源/口径": "新浪历史流通股本变更序列前向匹配", "限制": "单位：股"},
         {"数据项": "历史盘后成交量/额", "状态": "已导出" if after_amount_count else "源未提供", "覆盖": f"{after_amount_count}/{len(daily)}行", "来源/口径": "新浪原始日线 postVol/postAmt", "限制": "非盘后交易股票或无成交日通常为0"},
-        {"数据项": "历史估算成交额（备用）", "状态": "已保留", "覆盖": f"{len(daily)}行", "来源/口径": "不复权典型价×成交量×100", "限制": "仅用于精确源失败时的降级，不替代精确成交额"},
-        {"数据项": "按当前流通股本估算换手率（备用）", "状态": "已保留", "覆盖": f"{len(daily)}行", "来源/口径": "成交股数÷当前流通股本", "限制": "仅用于精确历史流通股本源失败时的降级"},
-        {"数据项": "理论涨跌停/触板标记", "状态": "已导出", "覆盖": f"{limit_count}/{len(daily)}行", "来源/口径": "不复权昨收×当前板块规则", "限制": "首行无昨收；IPO无涨跌幅期和历史ST状态需复核"},
-        {"数据项": "逐笔主交易量", "状态": "已导出", "覆盖": f"{meta.get('main_trade_rows', 0)}条", "来源/口径": "排除竞价快照和盘后定价", "限制": meta.get("completeness_note", "")},
-        {"数据项": "逐笔主交易量与行情对账", "状态": "通过" if quote_volume is not None and abs(main_detail_volume - quote_volume) < 0.001 else "不一致", "覆盖": f"逐笔{main_detail_volume:.0f}手 / 行情{quote_volume:.0f}手" if quote_volume is not None else f"逐笔{main_detail_volume:.0f}手 / 行情缺失", "来源/口径": "主交易成交记录 vs 行情成交量", "限制": "盘中抓取时两接口时间点可能相差数秒"},
-        {"数据项": "分钟主交易量与行情对账", "状态": "通过" if quote_volume is not None and abs(main_minute_volume - quote_volume) < 0.001 else "不一致", "覆盖": f"分钟{main_minute_volume:.0f}手 / 行情{quote_volume:.0f}手" if quote_volume is not None else f"分钟{main_minute_volume:.0f}手 / 行情缺失", "来源/口径": "15:00前分钟增量 vs 行情成交量", "限制": "盘中抓取时两接口时间点可能相差数秒"},
+        {"数据项": "历史估算成交额（备用）", "状态": "已保留" if daily else "缺失", "覆盖": f"{len(daily)}行", "来源/口径": "不复权典型价×成交量×100", "限制": "仅用于精确源失败时的降级，不替代精确成交额"},
+        {"数据项": "按当前流通股本估算换手率（备用）", "状态": "已保留" if daily else "缺失", "覆盖": f"{len(daily)}行", "来源/口径": "成交股数÷当前流通股本", "限制": "仅用于精确历史流通股本源失败时的降级"},
+        {"数据项": "理论涨跌停/触板标记", "状态": "已导出" if limit_count else "缺失", "覆盖": f"{limit_count}/{len(daily)}行", "来源/口径": "不复权昨收×当前板块规则", "限制": "首行无昨收；IPO无涨跌幅期和历史ST状态需复核"},
+        {"数据项": "逐笔主交易量", "状态": "已导出" if details else "缺失", "覆盖": f"{meta.get('main_trade_rows', 0)}条", "来源/口径": "排除竞价快照和盘后定价", "限制": meta.get("completeness_note", "")},
+        {"数据项": "逐笔主交易量与行情对账", "状态": reconciliation_status("明细主交易量对账"), "覆盖": f"已知逐笔{main_detail_volume:.0f}手 / 行情{quote_volume:.0f}手" if quote_volume is not None else f"已知逐笔{main_detail_volume:.0f}手 / 行情缺失", "来源/口径": "主交易成交记录 vs 行情成交量", "限制": (source_checks.get("明细主交易量对账") or {}).get("detail", "缺少可核验数据")},
+        {"数据项": "分钟主交易量与行情对账", "状态": reconciliation_status("分时主交易量对账"), "覆盖": f"已知分钟{main_minute_volume:.0f}手 / 行情{quote_volume:.0f}手" if quote_volume is not None else f"已知分钟{main_minute_volume:.0f}手 / 行情缺失", "来源/口径": "15:00前分钟增量 vs 行情成交量", "限制": (source_checks.get("分时主交易量对账") or {}).get("detail", "缺少可核验数据")},
         {"数据项": "逐笔精确金额", "状态": "已导出" if exact_detail_amount else "接口未提供", "覆盖": f"{exact_detail_amount}/{len(details)}行", "来源/口径": "原接口字段", "限制": "缺失时另列价格×成交量×100估算金额"},
         {"数据项": "行业指数和同业排名", "状态": "尚未接入", "覆盖": "0", "来源/口径": "—", "限制": "需要证券行业分类和成分历史库"},
         {"数据项": "财务/估值/公告/新闻/资金流/融资融券", "状态": "尚未接入", "覆盖": "0", "来源/口径": "—", "限制": "属于低频和事件数据，需单独数据源及时间对齐"},
     ]
+    from research_data import binding
+    research = result.get("research")
+    if isinstance(research, dict) and (research.get("code"), research.get("as_of")) == binding(result):
+        rows = [r for r in rows if r["数据项"] not in {"行业指数和同业排名", "财务/估值/公告/新闻/资金流/融资融券"}]
+        for key, source in (research.get("sources") or {}).items():
+            rows.append({"数据项": "研究 / " + key, "状态": "已取得" if source.get("rows") else "本次无可用记录",
+                         "覆盖": f"{len(source.get('rows') or [])}行", "来源/口径": source.get("source"),
+                         "限制": source.get("note", "") + ("；窗口截取，非完整历史" if source.get("truncated") else "")})
+        for key in research.get("errors") or {}:
+            rows.append({"数据项": "研究 / " + key, "状态": "本次未获取", "覆盖": "缺失不是0", "来源/口径": "—", "限制": "来源失败或结构不符"})
+        rows.append({"数据项": "完整新闻/融资融券/历史行业成分/预测回测", "状态": "尚未接入", "覆盖": "0", "来源/口径": "—", "限制": "不能据此声称预测精度"})
     return rows
 
 
-def write_svg(path: Path, rows: list[dict[str, Any]], title: str) -> None:
-    prices = [num(row.get("\u4ef7\u683c")) for row in rows]
-    prices = [x for x in prices if x is not None]
-    if not prices:
-        path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='800' height='400'><text x='20' y='30'>No intraday data</text></svg>", encoding="utf-8")
-        return
-    width, height, left, top = 1000, 500, 60, 40
-    low, high = min(prices), max(prices) or min(prices) + 1
-    if high == low:
-        high += 1
-    def x(i: int) -> float:
-        return left + i * (width - left - 20) / max(1, len(prices) - 1)
-    def y(v: float) -> float:
-        return top + (high - v) * 320 / (high - low)
-    points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(prices))
-    path.write_text(f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'><rect width='100%' height='100%' fill='#101827'/><text x='{left}' y='25' fill='white'>{title}</text><polyline points='{points}' fill='none' stroke='#38bdf8' stroke-width='2'/></svg>", encoding="utf-8")
-
-
 def export_result(result: dict[str, Any], folder: str, health: list[dict[str, Any]] | None = None) -> list[Path]:
-    """Export only machine-readable datasets needed for subsequent analysis."""
+    """Publish a complete unique batch, with JSON last as its completion marker."""
     target = Path(folder)
-    target.mkdir(parents=True, exist_ok=True)
-    stem = f"{result['identity']['code']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    daily = target / f"{stem}_daily_indicators.csv"
-    benchmark = target / f"{stem}_benchmark.csv"
-    intraday = target / f"{stem}_intraday.csv"
-    details = target / f"{stem}_details.csv"
-    snapshot = target / f"{stem}_analysis.json"
+    stem = f"{result['identity']['code']}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
     daily_rows = result.get("daily_indicators") or enrich_daily_indicators(result.get("daily_history") or result.get("daily") or [], result.get("identity"), result.get("quote"))
-    write_csv(daily, daily_rows)
-    write_csv(benchmark, result.get("benchmark_indicators") or result.get("benchmark_history") or [])
-    write_csv(intraday, result.get("intraday") or [])
-    write_csv(details, result.get("details") or [])
+    datasets = {
+        "daily_indicators": daily_rows,
+        "benchmark": result.get("benchmark_indicators") or result.get("benchmark_history") or [],
+        "intraday": result.get("intraday") or [],
+        "details": result.get("details") or [],
+    }
+    filenames = {key: f"{stem}_{key}.csv" for key, rows in datasets.items() if rows}
+    filenames["analysis"] = f"{stem}_analysis.json"
+    export_view = {**result, "daily_indicators": daily_rows}
     payload = {
+        "schema_version": 2,
         "identity": result.get("identity"), "fetched_at": result.get("fetched_at"),
         "quote": result.get("quote"), "analysis": result.get("analysis") or build_analysis(result),
         "details_meta": result.get("details_meta"), "trade_summary": build_trade_summary_rows(result),
-        "data_quality": build_data_quality_rows(result), "sources": result.get("sources"), "errors": result.get("errors"),
+        "history_sync": result.get("history_sync"),
+        "data_quality": build_data_quality_rows(export_view), "sources": result.get("sources"), "errors": result.get("errors"),
+        "quality_checks": build_quality_checks(export_view), "dashboard": summarize_dashboard(export_view),
+        "dataset_counts": {key: len(rows) for key, rows in datasets.items()},
+        "export_files": filenames,
+        "missing_datasets": [key for key, rows in datasets.items() if not rows],
+        "export_note": "只导出已有数据；缺失数据集不生成空CSV。技术观察不是价格预测或买卖建议。",
     }
-    snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return [path for path in (daily, benchmark, intraday, details, snapshot) if path.exists()]
+    from research_data import binding
+    code, as_of = binding(result)
+    research = result.get("research")
+    if isinstance(research, dict) and research.get("code") == code and research.get("as_of") == as_of:
+        from research_analysis import analyze_research
+        payload["research"] = research
+        payload["research_analysis"] = analyze_research(result, research)
+    # Validate all rows before any final file is visible, including non-finite CSV values.
+    json.dumps(datasets, ensure_ascii=False, allow_nan=False)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+    target.mkdir(parents=True, exist_ok=True)
+    published: list[Path] = []
+    with tempfile.TemporaryDirectory(prefix=".stock-export-", dir=target) as staging:
+        stage = Path(staging)
+        for key, rows in datasets.items():
+            if rows:
+                write_csv(stage / filenames[key], rows)
+        (stage / filenames["analysis"]).write_text(serialized, encoding="utf-8")
+        try:
+            for filename in filenames.values():
+                destination = target / filename
+                # UUID names avoid overwriting existing exports; guard unexpected collisions too.
+                if destination.exists():
+                    raise FileExistsError(f"导出文件已经存在：{destination.name}")
+                os.replace(stage / filename, destination)
+                published.append(destination)
+        except Exception:
+            for destination in published:
+                destination.unlink(missing_ok=True)
+            raise
+    return published
 
 
 class App(tk.Tk):
+    """Compact analysis workspace; acquisition work never touches Tk widgets."""
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("1000x650")
-        self.minsize(760, 480)
+        from workspace_state import load_preferences
+        self.preferences = load_preferences()
+        self.title("股票走势工作台")
+        self.geometry("1040x700")
+        self.minsize(760, 520)
         self.result: dict[str, Any] | None = None
         self.live_identity: StockIdentity | None = None
         self.live_enabled = False
         self.live_busy = False
         self.live_job = None
         self.live_generation = 0
+        self.live_inflight_generation = None
+        self.details_busy = False
+        self.details_inflight_generation = None
+        self.last_details_refresh = 0.0
+        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.fetch_generation = 0
+        self.pending_query = None
+        self.history_resync_pending = False
+        self.history_resync_target = ""
+        self.history_resync_code = ""
+        self.resume_live_after_fetch = False
+        self.export_busy = False
+        self.closing = False
+        self._live_errors: dict[str, str] = {}
+        self._detail_attempted = False
         self.health: list[dict[str, Any]] = []
-        self.events: list[tuple[str, Any]] = []
+        self.current_intraday: list[dict[str, Any]] = []
         self.build()
-        self.after(150, self.poll)
+        self.poll_job = self.after(150, self.poll)
+        self.protocol("WM_DELETE_WINDOW", self.close)
 
     def build(self):
-        top = ttk.Frame(self, padding=12); top.pack(fill="x")
-        ttk.Label(top, text=APP_TITLE, font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
-        ttk.Label(top, text="\u540d\u79f0/\u4ee3\u7801/\u7f51\u5740", foreground="#64748b").pack(side="left", padx=(14, 6))
-        self.query = tk.StringVar(value=DEFAULT_QUERY)
-        ttk.Entry(top, textvariable=self.query, width=20).pack(side="left")
-        ttk.Button(top, text="\u67e5\u8be2", command=self.start_fetch).pack(side="left", padx=6)
-        self.live_button = ttk.Button(top, text="\u5f00\u542f\u5b9e\u65f6\u5237\u65b0", command=self.toggle_live)
-        self.live_button.pack(side="left", padx=6)
-        ttk.Button(top, text="\u63a5\u53e3\u6d4b\u8bd5", command=self.start_health).pack(side="left")
-        self.export = ttk.Button(top, text="\u5bfc\u51fa", command=self.do_export, state="disabled"); self.export.pack(side="left", padx=6)
-        self.status = tk.StringVar(value="\u5c31\u7eea"); ttk.Label(self, textvariable=self.status, foreground="#64748b").pack(fill="x", padx=14)
-        self.tabs = ttk.Notebook(self); self.tabs.pack(fill="both", expand=True, padx=12, pady=12)
-        self.overview = ttk.Frame(self.tabs, padding=10); self.chart = ttk.Frame(self.tabs, padding=10); self.detail = ttk.Frame(self.tabs, padding=10); self.daily = ttk.Frame(self.tabs, padding=10); self.billboard = ttk.Frame(self.tabs, padding=10); self.chips_tab = ttk.Frame(self.tabs, padding=10); self.health_tab = ttk.Frame(self.tabs, padding=10)
-        for tab, text in ((self.overview,"\u6982\u89c8"),(self.chart,"\u5206\u65f6"),(self.detail,"\u9010\u7b14"),(self.daily,"\u65e5\u7ebf"),(self.billboard,"\u9f99\u864e\u699c"),(self.chips_tab,"\u7b79\u7801"),(self.health_tab,"\u63a5\u53e3\u6d4b\u8bd5")): self.tabs.add(tab, text=text)
+        from stock_charts import StockChart
+        from ai_panel import AiPanel
+        from research_panel import ResearchPanel
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Treeview", rowheight=25, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Dashboard.TLabel", font=("Microsoft YaHei UI", 10))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 15, "bold"))
+
+        toolbar = ttk.Frame(self, padding=(12, 10, 12, 4))
+        toolbar.pack(fill="x")
+        first = ttk.Frame(toolbar)
+        first.pack(fill="x")
+        ttk.Label(first, text="股票走势工作台", style="Title.TLabel").grid(row=0, column=0, padx=(0, 14))
+        ttk.Label(first, text="名称 / 代码 / 网址", foreground="#64748b").grid(row=0, column=1, padx=(0, 6))
+        recent = self.preferences.get("recent_queries") or []
+        self.query = tk.StringVar(value=recent[0] if recent else DEFAULT_QUERY)
+        self.query_box = ttk.Combobox(first, textvariable=self.query, width=23)
+        self.query_box.grid(row=0, column=2, sticky="ew")
+        first.columnconfigure(2, weight=1)
+        self.query_box.bind("<Return>", lambda _event: self.start_fetch())
+        ttk.Button(first, text="查询 / 刷新", command=self.start_fetch, width=12).grid(row=0, column=3, padx=(8, 0))
+
+        second = ttk.Frame(toolbar)
+        second.pack(fill="x", pady=(8, 0))
+        ttk.Label(second, text="刷新间隔").pack(side="left")
+        self.refresh_seconds = tk.StringVar(value=str(self.preferences.get("refresh_seconds", 15)))
+        interval = ttk.Combobox(second, textvariable=self.refresh_seconds, values=("5", "10", "15", "30", "60"), state="readonly", width=4)
+        interval.pack(side="left", padx=(6, 2))
+        interval.bind("<<ComboboxSelected>>", self.interval_changed)
+        ttk.Label(second, text="秒").pack(side="left", padx=(0, 8))
+        self.live_button = ttk.Button(second, text="开启实时", command=self.toggle_live, width=11)
+        self.live_button.pack(side="left")
+        self.favorite_text = tk.StringVar(value="☆ 收藏")
+        self.favorite_button = ttk.Button(second, textvariable=self.favorite_text, command=self.toggle_favorite, width=11, state="disabled")
+        self.favorite_button.pack(side="left", padx=6)
+        self.export = ttk.Button(second, text="导出分析数据", command=self.do_export, state="disabled", width=14)
+        self.export.pack(side="left")
+        self.choose_export_button = ttk.Button(second, text="另选目录…", command=self.choose_export_folder, state="disabled", width=11)
+        self.choose_export_button.pack(side="left", padx=6)
+
+        self.status = tk.StringVar(value="输入股票代码后查询；F5 刷新，Ctrl+E 导出。")
+        self.status_label = ttk.Label(self, textvariable=self.status, foreground="#64748b", wraplength=960)
+        self.status_label.pack(fill="x", padx=14, pady=(3, 2))
+        self.snapshot_info = tk.StringVar(value="行情时间 —   ·   交易日 —   ·   数据来源 —")
+        self.snapshot_label = ttk.Label(self, textvariable=self.snapshot_info, foreground="#475569", wraplength=960)
+        self.snapshot_label.pack(fill="x", padx=14, pady=(0, 5))
+
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        self.overview = ttk.Frame(self.tabs, padding=8)
+        self.chart = ttk.Frame(self.tabs, padding=8)
+        self.detail = ttk.Frame(self.tabs, padding=8)
+        self.daily = ttk.Frame(self.tabs, padding=8)
+        self.quality_tab = ttk.Frame(self.tabs, padding=8)
+        self.billboard = ttk.Frame(self.tabs, padding=8)
+        self.ai_panel = AiPanel(self.tabs, self.preferences, self.persist_preferences)
+        self.research_panel = ResearchPanel(self.tabs, self.research_loaded)
+        for tab, label in ((self.overview, "走势概览"), (self.chart, "走势图"), (self.detail, "成交明细"),
+                           (self.daily, "历史指标"), (self.quality_tab, "数据质量"), (self.billboard, "龙虎榜"), (self.research_panel, "研究分析"), (self.ai_panel, "AI 分析")):
+            self.tabs.add(tab, text=label)
+
         self.metrics: dict[str, tk.StringVar] = {}
-        for i, name in enumerate(("\u540d\u79f0","\u6700\u65b0\u4ef7","\u6da8\u8dcc\u5e45(%)","\u6210\u4ea4\u989d","\u6210\u4ea4\u91cf(\u624b)","\u6362\u624b\u7387(%)","\u603b\u5e02\u503c","\u6d41\u901a\u5e02\u503c","\u4eca\u5f00","\u6700\u9ad8","\u6700\u4f4e","估算平均成本")):
-            box=ttk.Frame(self.overview,padding=10); box.grid(row=i//4,column=i%4,sticky="nsew",padx=4,pady=4); self.overview.columnconfigure(i%4,weight=1); ttk.Label(box,text=name,foreground="#64748b").pack(anchor="w"); self.metrics[name]=tk.StringVar(value="-"); ttk.Label(box,textvariable=self.metrics[name],font=("Segoe UI",14,"bold")).pack(anchor="w")
-        self.warning=tk.StringVar(); ttk.Label(self.overview,textvariable=self.warning,foreground="#b45309",wraplength=1050).grid(row=3,column=0,columnspan=4,sticky="w",pady=15)
-        self.canvas=tk.Canvas(self.chart,bg="#101827",highlightthickness=0); self.canvas.pack(fill="both",expand=True)
-        self.current_intraday: list[dict[str, Any]] = []
-        self.canvas.bind("<Configure>", lambda _event: self.draw(self.current_intraday))
-        self.trees={"detail":self.tree(self.detail,[("\u65f6\u95f4",100),("\u4ef7\u683c",90),("\u6210\u4ea4\u91cf",100),("\u65b9\u5411",90),("\u91d1\u989d",120)]),"daily":self.tree(self.daily,[("\u65e5\u671f",100),("\u5f00\u76d8",90),("\u6536\u76d8",90),("\u6700\u9ad8",90),("\u6700\u4f4e",90),("\u6210\u4ea4\u91cf",110),("\u6210\u4ea4\u989d",130)]),"billboard":self.tree(self.billboard,[("\u4ea4\u6613\u65e5\u671f",100),("\u4e0a\u699c\u539f\u56e0",300),("\u6536\u76d8\u4ef7",90),("\u6da8\u8dcc\u5e45(%)",95),("\u6362\u624b\u7387(%)",95),("\u4e70\u5165\u989d",120),("\u5356\u51fa\u989d",120),("\u51c0\u4e70\u5165\u989d",120)]),"chips":self.tree(self.chips_tab,[("\u6210\u672c\u4ef7",120),("\u4f30\u7b97\u7b79\u7801\u91cf",160),("\u5360\u6bd4(%)",100)]),"health":self.tree(self.health_tab,[("\u63a5\u53e3",190),("\u72b6\u6001",80),("\u8017\u65f6(ms)",90),("\u8bf4\u660e",700)])}
+        self.metric_labels = {}
+        cards = ttk.Frame(self.overview)
+        cards.pack(fill="x")
+        for i, name in enumerate(("最新价", "涨跌幅(%)", "成交额", "成交量(手)", "换手率(%)", "今开", "最高", "最低")):
+            card = ttk.LabelFrame(cards, text=name, padding=(9, 7))
+            card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
+            cards.columnconfigure(i % 4, weight=1, uniform="cards")
+            self.metrics[name] = tk.StringVar(value="—")
+            label = ttk.Label(card, textvariable=self.metrics[name], font=("Segoe UI", 15, "bold"))
+            label.pack(anchor="w")
+            self.metric_labels[name] = label
+        self.warning = tk.StringVar(value="未查询。成交明细完整性需成交量对账，备用汇总不等于交易所原始逐笔。")
+        self.warning_label = ttk.Label(self.overview, textvariable=self.warning, foreground="#a16207", wraplength=900)
+        self.warning_label.pack(fill="x", padx=4, pady=(7, 5))
+        overview_body = ttk.Frame(self.overview)
+        overview_body.pack(fill="both", expand=True, pady=(3, 0))
+        self.overview_text = tk.Text(overview_body, wrap="word", bg="#f8fafc", fg="#334155", relief="flat",
+                                    font=("Microsoft YaHei UI", 10), padx=12, pady=10, height=8, state="disabled")
+        overview_scroll = ttk.Scrollbar(overview_body, orient="vertical", command=self.overview_text.yview)
+        self.overview_text.configure(yscrollcommand=overview_scroll.set)
+        self.overview_text.pack(side="left", fill="both", expand=True)
+        overview_scroll.pack(side="right", fill="y")
+        self.overview_text.tag_configure("heading", font=("Microsoft YaHei UI", 11, "bold"), foreground="#0f172a")
+        self.overview_text.tag_configure("muted", foreground="#64748b")
+        self.set_overview_text([("查询后展示均线、阶段涨跌、量价与波动情况。", "heading"),
+                                ("这里描述已有走势，不提供买卖建议；盘中日线及指标尚未定稿。", "muted")])
+
+        controls = ttk.Frame(self.chart)
+        controls.pack(fill="x", pady=(0, 6))
+        ttk.Label(controls, text="图表").pack(side="left")
+        self.chart_mode = tk.StringVar(value=self.preferences.get("chart_mode", "日线"))
+        mode = ttk.Combobox(controls, textvariable=self.chart_mode, values=("日线", "分时"), state="readonly", width=6)
+        mode.pack(side="left", padx=(6, 14))
+        mode.bind("<<ComboboxSelected>>", self.chart_changed)
+        ttk.Label(controls, text="日线范围").pack(side="left")
+        self.daily_range = tk.StringVar(value=str(self.preferences.get("daily_range", 60)))
+        range_box = ttk.Combobox(controls, textvariable=self.daily_range, values=("30", "60", "120", "250"), state="readonly", width=5)
+        range_box.pack(side="left", padx=(6, 3))
+        range_box.bind("<<ComboboxSelected>>", self.chart_changed)
+        ttk.Label(controls, text="日", foreground="#64748b").pack(side="left", padx=5)
+        self.chart_indicator = tk.StringVar(value="成交量")
+        indicator = ttk.Combobox(controls, textvariable=self.chart_indicator, values=("成交量", "MACD"), state="readonly", width=7)
+        indicator.pack(side="left", padx=8)
+        indicator.bind("<<ComboboxSelected>>", self.chart_changed)
+        self.show_vwap = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="分时均价", variable=self.show_vwap, command=self.chart_changed).pack(side="left", padx=3)
+        ttk.Label(controls, text="鼠标查看数据", foreground="#64748b").pack(side="right", padx=3)
+        self.stock_chart = StockChart(self.chart)
+        self.stock_chart.pack(fill="both", expand=True)
+        self.canvas = self.stock_chart.canvas
+        self.stock_chart.set_mode(self.chart_mode.get())
+        self.stock_chart.set_daily_range(int(self.daily_range.get()))
+
+        filters = ttk.Frame(self.detail)
+        filters.pack(fill="x", pady=(0, 6))
+        ttk.Label(filters, text="方向").pack(side="left")
+        self.direction_filter = tk.StringVar(value="全部")
+        directions = ttk.Combobox(filters, textvariable=self.direction_filter, values=("全部", "买盘", "卖盘", "中性"), width=6, state="readonly")
+        directions.pack(side="left", padx=(5, 12))
+        directions.bind("<<ComboboxSelected>>", self.filter_details)
+        ttk.Label(filters, text="阶段").pack(side="left")
+        self.phase_filter = tk.StringVar(value="全部")
+        phases = ttk.Combobox(filters, textvariable=self.phase_filter,
+                             values=("全部", "主交易", "连续竞价", "开盘集合竞价", "收盘集合竞价", "盘后定价交易", "竞价快照"),
+                             width=12, state="readonly")
+        phases.pack(side="left", padx=(5, 12))
+        phases.bind("<<ComboboxSelected>>", self.filter_details)
+        ttk.Label(filters, text="最小手数").pack(side="left")
+        self.minimum_lots = tk.StringVar(value="0")
+        lots = ttk.Combobox(filters, textvariable=self.minimum_lots, values=("0", "10", "50", "100", "500"), width=6)
+        lots.pack(side="left", padx=(5, 6))
+        lots.bind("<Return>", self.filter_details)
+        lots.bind("<<ComboboxSelected>>", self.filter_details)
+        ttk.Button(filters, text="筛选", command=self.filter_details, width=6).pack(side="left")
+        self.detail_count = tk.StringVar(value="暂无成交明细")
+        ttk.Label(self.detail, textvariable=self.detail_count, foreground="#64748b").pack(fill="x", pady=(0, 5))
+        self.detail_columns = ["时间", "价格", "成交量(手)", "方向", "交易阶段", "记录性质", "金额/估算金额"]
+        self.daily_columns = ["日期", "收盘", "涨跌幅(%)", "成交量(手)", "成交额", "换手率(%)", "MA5", "MA20", "MA60", "MACD", "RSI6"]
+        self.trees = {
+            "detail": self.tree(self.detail, list(zip(self.detail_columns, (95, 85, 105, 75, 135, 105, 150)))),
+            "daily": self.tree(self.daily, list(zip(self.daily_columns, (105, 90, 105, 115, 135, 110, 90, 90, 90, 90, 90)))),
+            "quality": self.tree(self.quality_tab, [("检查项", 160), ("状态", 90), ("说明", 820)]),
+            "billboard": self.tree(self.billboard, [("交易日期", 105), ("上榜原因", 370), ("收盘价", 90),
+                              ("涨跌幅(%)", 105), ("换手率(%)", 105), ("买入额", 130), ("卖出额", 130), ("净买入额", 130)]),
+        }
+        self.daily_note = tk.StringVar(value="前复权价格用于趋势指标；成交额与换手率保留各自来源口径。横向滚动可查看全部指标。")
+        ttk.Label(self.daily, textvariable=self.daily_note, foreground="#64748b", wraplength=920).pack(fill="x", pady=(5, 0))
+        self.billboard_note = tk.StringVar(value="龙虎榜为补充事件数据；没有记录不代表接口异常。")
+        ttk.Label(self.billboard, textvariable=self.billboard_note, foreground="#64748b").pack(fill="x", pady=(5, 0))
+        ttk.Label(self.quality_tab, text="完整性、来源与时点一起查看；“已对账”不等于交易所原始逐笔已获取。",
+                  foreground="#64748b", wraplength=920).pack(fill="x", pady=(5, 0))
+        self.bind("<F5>", lambda _event: self.start_fetch())
+        self.bind("<Control-e>", lambda _event: self.do_export())
+        self.bind("<Control-E>", lambda _event: self.do_export())
+        self.bind("<Configure>", self.window_resized, add="+")
+        self.update_query_choices()
+
+    def window_resized(self, event):
+        if event.widget is not self:
+            return
+        width = max(600, event.width - 44)
+        for label in (self.status_label, self.snapshot_label, self.warning_label):
+            label.configure(wraplength=width)
 
     def tree(self, parent, cols):
-        frame=ttk.Frame(parent); frame.pack(fill="both",expand=True); names=[x[0] for x in cols]; tree=ttk.Treeview(frame,columns=names,show="headings"); sy=ttk.Scrollbar(frame,orient="vertical",command=tree.yview); tree.configure(yscrollcommand=sy.set); tree.grid(row=0,column=0,sticky="nsew"); sy.grid(row=0,column=1,sticky="ns"); frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
-        for name,width in cols: tree.heading(name,text=name); tree.column(name,width=width,anchor="center")
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        names = [item[0] for item in cols]
+        tree = ttk.Treeview(frame, columns=names, show="headings")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        for name, width in cols:
+            tree.heading(name, text=name)
+            tree.column(name, width=width, minwidth=70, anchor="center", stretch=False)
         return tree
 
-    def start_fetch(self):
-        try: identity=parse_query(self.query.get())
-        except SpiderError as exc: messagebox.showerror("\u8f93\u5165\u6709\u8bef",str(exc)); return
+    def persist_preferences(self):
+        from workspace_state import save_preferences
+        self.preferences.update(refresh_seconds=int(self.refresh_seconds.get()),
+                                chart_mode=self.chart_mode.get(), daily_range=int(self.daily_range.get()))
+        return save_preferences(self.preferences)
+
+    def update_query_choices(self):
+        values = list(dict.fromkeys([*(self.preferences.get("watchlist") or []), *(self.preferences.get("recent_queries") or [])]))
+        self.query_box.configure(values=values)
+        code = (self.result or {}).get("identity", {}).get("code")
+        self.favorite_text.set("★ 取消收藏" if code and code in (self.preferences.get("watchlist") or []) else "☆ 收藏")
+
+    def remember_query(self):
+        code = (self.result or {}).get("identity", {}).get("code")
+        if code:
+            recent = self.preferences.get("recent_queries") or []
+            self.preferences["recent_queries"] = [code, *[item for item in recent if item != code]][:15]
+            self.persist_preferences()
+            self.update_query_choices()
+
+    def toggle_favorite(self):
+        code = (self.result or {}).get("identity", {}).get("code")
+        if not code:
+            return
+        favorites = list(self.preferences.get("watchlist") or [])
+        if code in favorites:
+            favorites.remove(code)
+        else:
+            favorites = [code, *favorites][:30]
+        self.preferences["watchlist"] = favorites
+        self.persist_preferences()
+        self.update_query_choices()
+        self.status.set("收藏已更新；下拉框可选择收藏和最近查询的股票。")
+
+    def interval_changed(self, _event=None):
+        self.persist_preferences()
+        if self.live_enabled and self.live_job is not None:
+            self.after_cancel(self.live_job)
+            self.live_job = self.after(int(self.refresh_seconds.get()) * 1000, self.live_tick)
+        self.status.set(f"实时刷新间隔：{self.refresh_seconds.get()} 秒；成交明细至少间隔 30 秒更新。")
+
+    def chart_changed(self, _event=None):
+        self.stock_chart.set_mode(self.chart_mode.get())
+        self.stock_chart.set_daily_range(int(self.daily_range.get()))
+        self.stock_chart.set_indicator("MACD" if self.chart_indicator.get() == "MACD" else "volume")
+        self.stock_chart.set_vwap_visible(self.show_vwap.get())
+        self.persist_preferences()
+        if self.result:
+            self.render_daily(self.result)
+
+    def update_action_states(self):
+        ready = bool(self.result) and self.pending_query is None and not self.history_resync_pending
+        if hasattr(self, "ai_panel"):
+            self.ai_panel.update_snapshot(self.result, ready=ready)
+        if hasattr(self, "research_panel"):
+            self.research_panel.update_snapshot(self.result, ready=ready)
+        state = "normal" if ready and not self.export_busy else "disabled"
+        self.export.configure(state=state)
+        self.choose_export_button.configure(state=state)
+        self.live_button.configure(state="normal" if self.pending_query is None and not self.history_resync_pending else "disabled")
+        self.favorite_button.configure(state="normal" if self.result and self.pending_query is None else "disabled")
+
+    def start_fetch(self, resume_live=False):
+        try:
+            identity = parse_query(self.query.get())
+        except SpiderError as exc:
+            self.status.set(str(exc))
+            return
+        query_key = (identity.market, identity.code) if identity.code else ("name", identity.name.casefold())
+        if self.pending_query == query_key:
+            self.status.set("这只股票正在查询，请等待完成；仍可查询其他股票。")
+            return
+        self.resume_live_after_fetch = resume_live
+        if self.history_resync_pending and identity.code and identity.code != self.history_resync_code:
+            self.history_resync_pending = False
+            self.history_resync_target = ""
+            self.history_resync_code = ""
         if self.live_enabled:
             self.toggle_live()
-        self.status.set("\u67e5\u8be2\u4e2d..."); threading.Thread(target=self.fetch_worker,args=(identity,),daemon=True).start()
+        self.fetch_generation += 1
+        self.pending_query = query_key
+        self.update_action_states()
+        self.status.set("正在采集行情、历史日线和成交明细…已有结果保留，完成后统一更新。")
+        threading.Thread(target=self.fetch_worker, args=(identity, self.fetch_generation), daemon=True).start()
 
     def toggle_live(self):
         if self.live_enabled:
@@ -1392,102 +1837,337 @@ class App(tk.Tk):
             if self.live_job is not None:
                 self.after_cancel(self.live_job)
                 self.live_job = None
-            self.live_button.configure(text="\u5f00\u542f\u5b9e\u65f6\u5237\u65b0")
-            self.status.set("\u5b9e\u65f6\u5237\u65b0\u5df2\u505c\u6b62")
+            self.live_button.configure(text="开启实时")
+            self.status.set("实时刷新已暂停；当前快照仍可分析和导出。")
             return
         if not self.result or not self.live_identity:
-            messagebox.showinfo("\u63d0\u793a", "\u8bf7\u5148\u67e5\u8be2\u4e00\u53ea\u80a1\u7968")
+            self.status.set("请先查询一只股票，再开启实时刷新。")
+            return
+        if self.history_resync_pending or self.pending_query is not None:
+            self.status.set("等待历史数据重新同步完成后，才能开启实时刷新。")
             return
         self.live_enabled = True
         self.live_generation += 1
-        self.live_button.configure(text="\u505c\u6b62\u5b9e\u65f6\u5237\u65b0")
-        self.status.set("\u5b9e\u65f6\u5237\u65b0\u5df2\u5f00\u542f（5\u79d2\u4e00\u6b21）")
+        self.last_details_refresh = time.monotonic()
+        self.live_button.configure(text="暂停实时")
+        self.status.set(f"实时刷新已开启：{self.refresh_seconds.get()} 秒；成交明细至少间隔 30 秒更新。")
         self.live_tick()
 
     def live_tick(self):
-        if not self.live_enabled or not self.live_identity or self.live_busy:
+        self.live_job = None
+        if not self.live_enabled or not self.live_identity:
+            return
+        if self.live_busy:
+            self.live_job = self.after(250, self.live_tick)
             return
         self.live_busy = True
-        threading.Thread(target=self.live_worker, args=(self.live_identity, self.live_generation), daemon=True).start()
+        self.live_inflight_generation = self.live_generation
+        interval = max(30, int(self.refresh_seconds.get()))
+        fetch_details = not self.details_busy and time.monotonic() - self.last_details_refresh >= interval
+        if fetch_details:
+            self.last_details_refresh = time.monotonic()
+            self.details_busy = True
+            self.details_inflight_generation = self.live_generation
+            target_date = market_date((self.result.get("quote") or {}).get("行情时间"))
+            threading.Thread(target=self.details_worker, args=(self.live_identity, self.live_generation, target_date), daemon=True).start()
+        threading.Thread(target=self.live_worker, args=(self.live_identity, self.live_generation, False), daemon=True).start()
 
-    def live_worker(self, identity, generation):
+    def live_worker(self, identity, generation, fetch_details=False):
         started = time.perf_counter()
         try:
             client = Client(timeout=8, pause=0.03)
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                quote_future = pool.submit(client.tencent_quote, identity)
-                intraday_future = pool.submit(client.tencent_intraday, identity)
-                details_future = pool.submit(client.eastmoney_details, identity)
-                quote = quote_future.result()
-                intraday = intraday_future.result()
-                try:
-                    details = details_future.result()
-                except SpiderError:
-                    details = {}
+            errors = {}
+            values = {"quote": {}, "intraday": {}, "details": {}}
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs = {"quote": pool.submit(client.quote_snapshot, identity, include_precision=False),
+                        "intraday": pool.submit(client.tencent_intraday, identity)}
+                for name, future in jobs.items():
+                    try:
+                        values[name] = future.result()
+                        if name == "intraday" and not ((values[name] or {}).get("data") or {}).get("trends"):
+                            errors[name] = "分时接口没有返回有效记录"
+                    except Exception as exc:
+                        errors[name] = str(exc)
             elapsed_ms = round((time.perf_counter() - started) * 1000)
-            self.events.append(("live", (generation, quote, intraday, details, datetime.now().strftime("%H:%M:%S"), elapsed_ms)))
+            if not values["quote"]:
+                self.events.put(("live_error", (generation, errors.get("quote", "本次未取得有效行情"), elapsed_ms)))
+                return
+            self.events.put(("live", (generation, values["quote"], values["intraday"], values["details"],
+                                     datetime.now().strftime("%H:%M:%S"), elapsed_ms, errors, False)))
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - started) * 1000)
-            self.events.append(("live_error", (generation, str(exc), elapsed_ms)))
-        finally:
-            self.live_busy = False
+            self.events.put(("live_error", (generation, str(exc), elapsed_ms)))
 
-    def fetch_worker(self, identity):
-        try: self.events.append(("result",Client().fetch(identity)))
-        except Exception as exc: self.events.append(("error",str(exc)))
+    def details_worker(self, identity, generation, target_date):
+        try:
+            details = Client(timeout=8, pause=0.03).deals(identity)
+            if not (details.get("data") or {}).get("details"):
+                raise SpiderError("明细接口没有返回成交记录")
+            self.events.put(("details", (generation, details, target_date)))
+        except Exception as exc:
+            self.events.put(("details_error", (generation, str(exc), target_date)))
+
+    def fetch_worker(self, identity, generation):
+        try:
+            self.events.put(("result", (generation, Client().fetch(identity))))
+        except Exception as exc:
+            self.events.put(("fetch_error", (generation, str(exc))))
 
     def start_health(self):
-        try: identity=parse_query(self.query.get())
-        except SpiderError as exc: messagebox.showerror("\u8f93\u5165\u6709\u8bef",str(exc)); return
-        self.status.set("\u63a5\u53e3\u6d4b\u8bd5\u4e2d..."); threading.Thread(target=self.health_worker,args=(identity,),daemon=True).start()
+        # Compatibility for diagnostic callers; no standalone interface-test UI.
+        try:
+            identity = parse_query(self.query.get())
+        except SpiderError as exc:
+            self.status.set(str(exc))
+            return
+        threading.Thread(target=self.health_worker, args=(identity,), daemon=True).start()
 
     def health_worker(self, identity):
         try:
-            c=Client(); identity=c.resolve(identity); self.events.append(("health",(identity,c.health(identity))))
-        except Exception as exc: self.events.append(("error",str(exc)))
+            client = Client()
+            identity = client.resolve(identity)
+            self.events.put(("health", (identity, client.health(identity))))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
 
     def poll(self):
-        while self.events:
-            kind,payload=self.events.pop(0)
-            if kind=="result":
-                self.result=payload
-                identity_data = payload.get("identity", {})
-                self.live_identity = StockIdentity(**{key: identity_data.get(key, "") for key in ("code", "market", "secid", "name", "source")})
-                self.render(payload); self.export.configure(state="normal"); self.status.set("\u67e5\u8be2\u5b8c\u6210")
-            elif kind=="live":
+        if getattr(self, "closing", False):
+            return
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "result":
+                generation, result = payload
+                if generation != self.fetch_generation:
+                    continue
+                self.pending_query = None
+                self.result = result
+                if self.history_resync_code and result.get("identity", {}).get("code") != self.history_resync_code:
+                    self.history_resync_target = ""
+                    self.history_resync_code = ""
+                history_sync = result.get("history_sync") or {}
+                quote_date = market_date((result.get("quote") or {}).get("行情时间"))
+                if history_sync and history_sync.get("status") != "aligned":
+                    self.history_resync_target = max(self.history_resync_target, quote_date)
+                    self.history_resync_code = result.get("identity", {}).get("code") or ""
+                source_rows = result.get("daily_history") or result.get("daily") or []
+                source_date = history_sync.get("daily_source_date") or max((str(row.get("日期") or "") for row in source_rows), default="")
+                target_met = not self.history_resync_target or (
+                    quote_date >= self.history_resync_target and source_date >= self.history_resync_target
+                    and (not history_sync or history_sync.get("status") == "aligned"))
+                self.history_resync_pending = not target_met
+                if target_met:
+                    self.history_resync_target = ""
+                    self.history_resync_code = ""
+                    result.pop("session_resync", None)
+                else:
+                    result["session_resync"] = {"pending": True, "target_date": self.history_resync_target}
+                identity = result.get("identity", {})
+                self.live_identity = StockIdentity(**{key: identity.get(key, "") for key in ("code", "market", "secid", "name", "source")})
+                self.render(result)
+                self.update_action_states()
+                self.remember_query()
+                failures = len(result.get("errors") or {})
+                self.status.set(f"查询完成：{len(result.get('daily_history') or [])} 日日线，{len(result.get('details') or [])} 条明细"
+                                + (f"；{failures} 项采集问题详见数据质量。" if failures else "。"))
+                if not target_met:
+                    self.status.set("数据源仍返回旧交易日，历史同步尚未完成；请稍后刷新。")
+                elif self.resume_live_after_fetch:
+                    self.resume_live_after_fetch = False
+                    self.toggle_live()
+            elif kind == "fetch_error":
+                generation, error = payload
+                if generation != self.fetch_generation:
+                    continue
+                self.pending_query = None
+                self.update_action_states()
+                self.status.set("查询失败：" + error + ("；保留上一次结果。" if self.result else "；可检查网络后重试。"))
+            elif kind == "live":
                 generation = payload[0]
+                if generation == self.live_inflight_generation:
+                    self.live_busy = False
+                    self.live_inflight_generation = None
                 if self.live_enabled and generation == self.live_generation:
+                    self._live_errors = payload[6] if len(payload) > 6 else {}
+                    self._detail_attempted = payload[7] if len(payload) > 7 else True
                     self.apply_live(payload[1:5])
-                    self.live_job = self.after(max(200, 5000 - payload[5]), self.live_tick)
-            elif kind=="live_error":
-                generation, _error, elapsed_ms = payload
+                    if self.live_enabled and generation == self.live_generation and self.live_job is None:
+                        interval = int(self.refresh_seconds.get()) * 1000
+                        self.live_job = self.after(max(200, interval - payload[5]), self.live_tick)
+            elif kind == "live_error":
+                generation, error, elapsed_ms = payload
+                if generation == self.live_inflight_generation:
+                    self.live_busy = False
+                    self.live_inflight_generation = None
                 if self.live_enabled and generation == self.live_generation:
-                    self.status.set("\u5b9e\u65f6\u66f4\u65b0\u5931\u8d25，5\u79d2\u540e\u91cd\u8bd5")
-                    self.live_job = self.after(max(200, 5000 - elapsed_ms), self.live_tick)
-            elif kind=="health":
-                self.health=payload[1]; self.fill(self.trees["health"],self.health,["\u63a5\u53e3","\u72b6\u6001","\u8017\u65f6(ms)","\u8bf4\u660e"]); ok=sum(x.get("\u72b6\u6001")=="\u6b63\u5e38" for x in self.health); self.status.set(f"\u63a5\u53e3\u6d4b\u8bd5\u5b8c\u6210: {ok}/{len(self.health)} \u6b63\u5e38")
-            else: messagebox.showerror("\u9519\u8bef",payload); self.status.set("\u5931\u8d25")
-        self.after(150,self.poll)
+                    self.result.setdefault("errors", {})["实时行情"] = error
+                    self.render_dashboard(self.result)
+                    self.status.set(f"行情刷新失败，{self.refresh_seconds.get()} 秒后重试：{error}")
+                    if self.live_job is None:
+                        interval = int(self.refresh_seconds.get()) * 1000
+                        self.live_job = self.after(max(200, interval - elapsed_ms), self.live_tick)
+            elif kind in {"details", "details_error"}:
+                generation, value, target_date = payload
+                if generation == self.details_inflight_generation:
+                    self.details_busy = False
+                    self.details_inflight_generation = None
+                if not self.live_enabled or generation != self.live_generation:
+                    continue
+                if kind == "details":
+                    self.apply_details(value, target_date)
+                else:
+                    self.result.setdefault("errors", {})["实时明细"] = value
+                    self.result.setdefault("details_meta", {})["final_complete"] = False
+                    self.result["details_meta"]["completeness_note"] = "明细刷新失败，保留原交易日的上次记录；当前快照完整性未验证。"
+                    self.render_dashboard(self.result)
+                    self.status.set("行情继续刷新，成交明细获取失败；详见数据质量。")
+            elif kind == "exported":
+                self.export_busy = False
+                self.update_action_states()
+                paths, folder = payload
+                self.preferences["last_export_dir"] = str(folder)
+                self.persist_preferences()
+                self.status.set(f"已导出 {len(paths)} 个文件至 {folder}；当前筛选不会截断导出数据。")
+                messagebox.showinfo("导出完成", f"已保存 {len(paths)} 个文件至：\n{folder}\n\n" +
+                                    "\n".join(path.name for path in paths) + "\n\n未取得的数据不会补造，缺失项见分析快照。")
+            elif kind == "export_error":
+                self.export_busy = False
+                self.update_action_states()
+                self.status.set("导出失败：" + payload)
+                messagebox.showerror("导出失败", payload)
+            elif kind == "health":
+                self.health = payload[1]
+                self.status.set("诊断完成；正常采集流程不再单独生成接口测试文件。")
+            else:
+                self.status.set("发生错误：" + str(payload))
+        self.poll_job = self.after(150, self.poll)
+
+    def set_overview_text(self, paragraphs):
+        self.overview_text.configure(state="normal")
+        self.overview_text.delete("1.0", "end")
+        for text, tag in paragraphs:
+            self.overview_text.insert("end", text + "\n\n", tag)
+        self.overview_text.configure(state="disabled")
 
     def render(self, result):
-        self.current_intraday = result.get("intraday", [])
-        self.metrics["\u540d\u79f0"].set(result["identity"].get("name") or result["identity"]["code"])
-        self.metrics["估算平均成本"].set(fmt((result.get("chips") or {}).get("平均成本")))
-        for key,var in self.metrics.items():
-            if key=="\u540d\u79f0": continue
-            if key=="估算平均成本": continue
-            value=result["quote"].get(key); var.set(amount(value) if key in {"\u6210\u4ea4\u989d","\u603b\u5e02\u503c","\u6d41\u901a\u5e02\u503c"} else (fmt(value,0) if key=="\u6210\u4ea4\u91cf(\u624b)" else fmt(value)+("%" if "%" in key else "")))
-        self.warning.set("\u90e8\u5206\u63a5\u53e3\u5931\u8d25: "+", ".join(result.get("errors",{})) if result.get("errors") else "\u6240\u6709\u4e3b\u8981\u6570\u636e\u5df2\u66f4\u65b0")
-        self.fill(self.trees["detail"],result["details"],["\u65f6\u95f4","\u4ef7\u683c","\u6210\u4ea4\u91cf","\u65b9\u5411","\u91d1\u989d"]); self.fill(self.trees["daily"],result["daily"],["\u65e5\u671f","\u5f00\u76d8","\u6536\u76d8","\u6700\u9ad8","\u6700\u4f4e","\u6210\u4ea4\u91cf","\u6210\u4ea4\u989d"]); self.fill(self.trees["billboard"],result["billboard"],["\u4ea4\u6613\u65e5\u671f","\u4e0a\u699c\u539f\u56e0","\u6536\u76d8\u4ef7","\u6da8\u8dcc\u5e45(%)","\u6362\u624b\u7387(%)","\u4e70\u5165\u989d","\u5356\u51fa\u989d","\u51c0\u4e70\u5165\u989d"]); self.fill(self.trees["chips"],(result.get("chips") or {}).get("筹码峰",[]),["成本价","估算筹码量","占比(%)"]); self.draw(result["intraday"])
+        self.current_intraday = result.get("intraday") or []
+        self.update_quote_view(result)
+        self.filter_details()
+        self.render_daily(result)
+        columns = ["交易日期", "上榜原因", "收盘价", "涨跌幅(%)", "换手率(%)", "买入额", "卖出额", "净买入额"]
+        self.fill(self.trees["billboard"], result.get("billboard") or [], columns)
+        self.billboard_note.set(f"取得 {len(result.get('billboard') or [])} 条龙虎榜记录；无记录不等于采集失败。")
+        self.render_dashboard(result)
+        chart_result = dict(result, daily=[], daily_history=[], daily_indicators=[]) if self.history_resync_pending else result
+        self.stock_chart.set_data(chart_result)
+        self.ai_panel.update_snapshot(result, ready=self.pending_query is None and not self.history_resync_pending)
+        self.research_panel.update_snapshot(result, ready=self.pending_query is None and not self.history_resync_pending)
+
+    def research_loaded(self, research, analysis):
+        from research_data import binding
+        code, as_of = binding(self.result)
+        if self.pending_query is not None or self.history_resync_pending or research.get("code") != code or research.get("as_of") != as_of:
+            return
+        self.result["research"] = research
+        self.result["research_analysis"] = analysis
+        self.ai_panel.update_snapshot(self.result, ready=True)
+        self.render_dashboard(self.result)
 
     def update_quote_view(self, result):
-        self.metrics["\u540d\u79f0"].set(result["identity"].get("name") or result["identity"]["code"])
-        self.metrics["估算平均成本"].set(fmt((result.get("chips") or {}).get("平均成本")))
-        for key, var in self.metrics.items():
-            if key in {"\u540d\u79f0", "估算平均成本"}:
+        quote = result.get("quote") or {}
+        for key, variable in self.metrics.items():
+            value = quote.get(key)
+            variable.set(amount(value) if key in {"成交额", "总市值", "流通市值"}
+                         else fmt(value, 0) if key == "成交量(手)" else fmt(value) + ("%" if "%" in key and num(value) is not None else ""))
+        change = num(quote.get("涨跌幅(%)"))
+        color = "#dc2626" if change is not None and change > 0 else "#15803d" if change is not None and change < 0 else "#334155"
+        for key in ("最新价", "涨跌幅(%)"):
+            if key in getattr(self, "metric_labels", {}):
+                self.metric_labels[key].configure(foreground=color)
+        if hasattr(self, "snapshot_info"):
+            identity = result.get("identity") or {}
+            stamp = market_timestamp(quote.get("行情时间"))
+            display_time = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}:{stamp[12:14]}" if len(stamp) == 14 else "未获取"
+            date = market_date(stamp) or "未获取"
+            source = (result.get("sources") or {}).get("quote") or "未标注"
+            self.snapshot_info.set(f"{identity.get('name') or '股票'} {identity.get('code') or ''}  ·  行情 {display_time}  ·  交易日 {date}\n来源：{source}")
+
+    def render_dashboard(self, result):
+        from analysis_tools import summarize_dashboard
+        dashboard = summarize_dashboard(result)
+        if self.history_resync_pending:
+            dashboard["summary"] = "行情与历史日线尚未同步，等待最新复权日线与基准数据。"
+            dashboard["observations"] = ["先核对行情日期与日线截止日期；不把实时未复权价格拼到滞后的复权序列。"]
+            dashboard["metrics"] = []
+            dashboard.setdefault("quality_checks", []).insert(0, {"item": "新交易日历史同步", "status": "warning", "detail": "等待同一股票的完整历史请求完成；技术指标和导出暂时停用。"})
+        paragraphs = [(dashboard.get("summary") or "暂无可分析数据。", "heading")]
+        observations = dashboard.get("observations") or []
+        if observations:
+            paragraphs.append(("\n".join("• " + item for item in observations), ""))
+        metrics = dashboard.get("metrics") or []
+        if metrics:
+            paragraphs.append(("分析指标", "heading"))
+            paragraphs.append(("\n".join(f"{row.get('label', '')}：{row.get('value', '—')}" +
+                                        (f"  ·  {row['note']}" if row.get("note") else "") for row in metrics), ""))
+        paragraphs.append(("指标描述历史与当前快照，不构成买卖建议。分时/成交明细日期以数据源为准；盘中指标会变化。", "muted"))
+        self.set_overview_text(paragraphs)
+        warnings = dashboard.get("warnings") or []
+        note = (result.get("details_meta") or {}).get("completeness_note") or ""
+        self.warning.set("；".join(dict.fromkeys([note, *warnings][:4])).strip("；") or "已完成数据质量检查，详见“数据质量”。")
+        labels = {"ok": "通过", "warning": "待注意", "error": "异常", "unavailable": "未获取"}
+        rows = [{"检查项": row.get("item"), "状态": labels.get(row.get("status"), row.get("status")),
+                 "说明": row.get("detail")} for row in dashboard.get("quality_checks") or []]
+        self.fill(self.trees["quality"], rows, ["检查项", "状态", "说明"])
+
+    def filter_details(self, _event=None):
+        if not self.result:
+            return
+        minimum = num(self.minimum_lots.get())
+        if minimum is None or minimum < 0:
+            self.detail_count.set("最小手数请输入大于或等于 0 的数字；导出仍包含全部明细。")
+            return
+        direction = self.direction_filter.get()
+        phase = self.phase_filter.get()
+        rows = []
+        original = self.result.get("details") or []
+        for row in original:
+            if direction != "全部" and row.get("方向") != direction:
                 continue
-            value = result["quote"].get(key)
-            var.set(amount(value) if key in {"\u6210\u4ea4\u989d", "\u603b\u5e02\u503c", "\u6d41\u901a\u5e02\u503c"} else (fmt(value, 0) if key == "\u6210\u4ea4\u91cf(\u624b)" else fmt(value) + ("%" if "%" in key else "")))
+            if phase == "主交易" and not row.get("计入主交易统计"):
+                continue
+            if phase == "竞价快照" and row.get("记录性质") != "行情快照":
+                continue
+            if phase not in {"全部", "主交易", "竞价快照"} and not str(row.get("交易阶段") or "").startswith(phase):
+                continue
+            if (num(row.get("成交量"), 0) or 0) < minimum:
+                continue
+            exact = num(row.get("金额"))
+            shown = dict(row)
+            shown["成交量(手)"] = row.get("成交量")
+            shown["金额/估算金额"] = amount(exact) if exact is not None else "估 " + amount(row.get("估算金额")) if row.get("估算金额") is not None else "—"
+            rows.append(shown)
+        self.fill(self.trees["detail"], rows, self.detail_columns)
+        trade_date = (self.result.get("details_meta") or {}).get("trade_date") or market_date((self.result.get("quote") or {}).get("行情时间")) or "未确认"
+        self.detail_count.set(f"显示 {len(rows)} / {len(original)} 条  ·  交易日 {trade_date}  ·  手数单位：100 股/手；“估”表示估算金额")
+
+    def render_daily(self, result):
+        if self.history_resync_pending:
+            self.fill(self.trees["daily"], [], self.daily_columns)
+            self.daily_note.set("交易日变化，等待新的复权历史数据；未把新日行情写入旧日复权序列。")
+            return
+        source = result.get("daily_indicators") or result.get("daily_history") or result.get("daily") or []
+        rows = []
+        for row in reversed(source[-int(self.daily_range.get()):]):
+            display = dict(row)
+            display["成交量(手)"] = row.get("成交量")
+            display["换手率(%)"] = row.get("可用历史换手率(%)", row.get("历史行情换手率(%)"))
+            rows.append(display)
+        self.fill(self.trees["daily"], rows, self.daily_columns)
+        scopes = list(dict.fromkeys(str(row.get("复权口径") or "未标注") for row in source))
+        scope_text = " / ".join(scopes) if scopes else "暂无数据"
+        self.daily_note.set(f"显示最近 {len(rows)} 日日线，完整导出 {len(source)} 日。价格口径：{scope_text}；换手率优先行情商显示值、其次历史股本口径值。")
 
     def apply_live(self, payload):
         quote, intraday, details, updated_at = payload
@@ -1495,73 +2175,232 @@ class App(tk.Tk):
             return
         live_fetched_at = datetime.now().isoformat(timespec="seconds")
         previous_quote = dict(self.result.get("quote") or {})
-        temp = normalize({"identity": dict(self.result["identity"]), "fetched_at": live_fetched_at, "quote": quote, "intraday": intraday, "daily": {}, "details": details, "billboard": {}, "errors": {}, "sources": {}})
-        previous_price = num(previous_quote.get("最新价"))
-        live_price = num(temp["quote"].get("最新价"))
-        if previous_price and live_price:
-            for key in ("总市值", "流通市值"):
-                previous_cap = num(previous_quote.get(key))
-                if previous_cap:
-                    temp["quote"][key] = previous_cap / previous_price * live_price
+        temp = normalize({"identity": dict(self.result["identity"]), "fetched_at": live_fetched_at,
+                          "quote": quote, "intraday": intraday, "daily": {}, "details": details,
+                          "billboard": {}, "errors": {}, "sources": {}})
+        previous_stamp = market_timestamp(previous_quote.get("行情时间"))
+        new_stamp = market_timestamp(temp["quote"].get("行情时间"))
+        expected_code = str(self.result["identity"].get("code") or "")
+        new_code = str(temp["quote"].get("代码") or "")
+        new_price = num(temp["quote"].get("最新价"))
+        if not new_stamp or new_price is None or new_price <= 0 or new_code != expected_code or (previous_stamp and new_stamp < previous_stamp):
+            self.status.set("行情代码、价格或时间异常/过期，已保留最新快照。")
+            return
+        date_changed = market_date(previous_stamp) != market_date(new_stamp)
+        if date_changed:
+            self.result["intraday"] = []
+            self.result["details"] = []
+            self.result["details_meta"] = {"final_complete": False, "completeness_note": "交易日已变化，旧日明细已清空，等待完整历史同步及明细更新。"}
+            self.last_details_refresh = 0.0
+            self.history_resync_pending = True
+            self.history_resync_target = market_date(new_stamp)
+            self.history_resync_code = expected_code
+            self.result["session_resync"] = {"pending": True, "target_date": self.history_resync_target}
+            self.current_intraday = []
+            self.filter_details()
+            self.render_daily(self.result)
+            self.render_dashboard(self.result)
+            chart_snapshot = dict(self.result, daily=[], daily_history=[], daily_indicators=[])
+            self.stock_chart.set_data(chart_snapshot)
+            self.query.set(expected_code)
+            self.start_fetch(resume_live=self.live_enabled)
+            return
         self.result["quote"] = temp["quote"]
         self.result["fetched_at"] = live_fetched_at
-        self.result["intraday"] = temp["intraday"]
-        if details:
+        errors = self.result.setdefault("errors", {})
+        live_errors = getattr(self, "_live_errors", {})
+        for key, label in (("quote", "实时行情"), ("intraday", "实时分时"), ("details", "实时明细")):
+            if key in live_errors:
+                errors[label] = live_errors[key]
+            elif key != "details" or getattr(self, "_detail_attempted", True):
+                errors.pop(label, None)
+        if temp["intraday"]:
+            minute_dates = {row.get("交易日期") for row in temp["intraday"] if row.get("交易日期")}
+            if minute_dates and minute_dates != {market_date(new_stamp)}:
+                errors["实时分时"] = "分时日期与行情日期不一致，未混合使用。"
+                if date_changed:
+                    self.result["intraday"] = []
+            else:
+                self.result["intraday"] = temp["intraday"]
+        elif intraday:
+            errors["实时分时"] = "本次分时接口返回空记录，保留上次同交易日的分时。"
+        if temp["details"]:
             self.result["details"] = temp["details"]
             self.result["details_meta"] = temp["details_meta"]
+            self.result["details_meta"]["last_refreshed_at"] = live_fetched_at
+            self.result.setdefault("sources", {})["details"] = "Eastmoney f1 full-day detail" if (details.get("meta") or {}).get("format") == "eastmoney" else "Tencent fallback"
+        else:
+            meta = self.result.setdefault("details_meta", {})
+            if getattr(self, "_detail_attempted", True):
+                errors["实时明细"] = "本次明细接口未返回有效记录，保留上次同交易日的记录。"
+                meta["final_complete"] = False
+                meta["completeness_note"] = "明细刷新失败，保留上次明细；并非当前快照全量。"
+            elif num(previous_quote.get("成交量(手)")) != num(temp["quote"].get("成交量(手)")):
+                meta["final_complete"] = False
+                meta["volume_reconciled"] = False
+                meta["completeness_note"] = "行情已更新，成交明细等待下次更新；当前两者不是同一时点。"
+        precision = (quote.get("meta") or {}).get("precision_matched")
+        self.result.setdefault("sources", {})["quote"] = "Tencent + Eastmoney matched precision" if precision else "Tencent realtime"
         sync_current_daily(self.result)
-        self.result["daily_indicators"] = enrich_daily_indicators(self.result.get("daily_history") or self.result.get("daily") or [], self.result.get("identity"), self.result.get("quote"))
+        self.result["daily_indicators"] = enrich_daily_indicators(self.result.get("daily_history") or self.result.get("daily") or [],
+                                                                  self.result.get("identity"), self.result.get("quote"))
         self.result["analysis"] = build_analysis(self.result)
-        self.current_intraday = temp["intraday"]
+        self.current_intraday = self.result.get("intraday") or []
         self.update_quote_view(self.result)
-        if details:
-            self.fill(self.trees["detail"], self.result["details"], ["时间", "价格", "成交量", "方向", "金额"])
-        self.fill(self.trees["daily"], self.result["daily"], ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额"])
-        self.draw(self.current_intraday)
+        if temp["details"]:
+            self.filter_details()
+        self.render_daily(self.result)
+        self.render_dashboard(self.result)
+        self.stock_chart.set_data(self.result)
+        self.ai_panel.update_snapshot(self.result, ready=self.pending_query is None and not self.history_resync_pending)
+        self.research_panel.update_snapshot(self.result, ready=self.pending_query is None and not self.history_resync_pending)
         if self.live_enabled:
-            self.status.set(f"\u5b9e\u65f6\u66f4\u65b0：{updated_at}")
+            self.status.set(f"实时更新：{updated_at}" + ("；部分数据未更新，详见数据质量。" if live_errors else "；行情/分时与明细分频更新。"))
+
+    def apply_details(self, details, target_date):
+        if not self.result:
+            return
+        current_quote = self.result.get("quote") or {}
+        current_date = market_date(current_quote.get("行情时间"))
+        source_date = (details.get("meta") or {}).get("trade_date")
+        if current_date != target_date or self.history_resync_pending or (source_date and source_date != target_date):
+            self.last_details_refresh = 0.0
+            self.status.set("旧交易日的明细请求已忽略；等待本交易日的明细。")
+            return
+        quote_fields = {"f57": current_quote.get("代码"), "f58": current_quote.get("名称"),
+                        "f43": current_quote.get("最新价"), "f47": current_quote.get("成交量(手)"),
+                        "f48": current_quote.get("成交额"), "f86": current_quote.get("行情时间")}
+        dates = {row.get("交易日期") for row in self.result.get("intraday") or [] if row.get("交易日期")}
+        minute_date = next(iter(dates)) if len(dates) == 1 else ""
+        fetched_at = datetime.now().isoformat(timespec="seconds")
+        temp = normalize({"identity": dict(self.result["identity"]), "fetched_at": fetched_at,
+                          "quote": {"data": quote_fields}, "intraday": {"meta": {"trade_date": minute_date}},
+                          "daily": {}, "details": details, "billboard": {}, "errors": {}, "sources": {}})
+        if not temp["details"]:
+            self.result.setdefault("errors", {})["实时明细"] = "本次明细没有有效成交记录，保留上次记录。"
+            self.render_dashboard(self.result)
+            return
+        self.result["details"] = temp["details"]
+        self.result["details_meta"] = temp["details_meta"]
+        self.result["details_meta"]["last_refreshed_at"] = fetched_at
+        self.result.setdefault("errors", {}).pop("实时明细", None)
+        self.result.setdefault("sources", {})["details"] = "Eastmoney f1 full-day detail" if (details.get("meta") or {}).get("format") == "eastmoney" else "Tencent fallback"
+        self.result["analysis"] = build_analysis(self.result)
+        self.filter_details()
+        self.render_dashboard(self.result)
+        self.status.set("成交明细已独立更新，并与当前行情成交量重新对账。")
+        self.ai_panel.update_snapshot(self.result, ready=self.pending_query is None and not self.history_resync_pending)
+        self.research_panel.update_snapshot(self.result, ready=self.pending_query is None and not self.history_resync_pending)
 
     def fill(self, tree, rows, cols):
-        tree.delete(*tree.get_children())
-        for row in rows:
-            vals=[]
+        children = list(tree.get_children())
+        for index, row in enumerate(rows):
+            values = []
             for col in cols:
-                v=row.get(col,""); vals.append(amount(v) if col in {"\u91d1\u989d","\u6210\u4ea4\u989d","\u4e70\u5165\u989d","\u5356\u51fa\u989d","\u51c0\u4e70\u5165\u989d"} else (fmt(v) if isinstance(v,float) else v))
-            tree.insert("","end",values=vals)
+                value = row.get(col, "")
+                values.append(amount(value) if col in {"金额", "成交额", "买入额", "卖出额", "净买入额"}
+                              else fmt(value) if isinstance(value, float) else "—" if value is None else value)
+            if index < len(children):
+                iid = children[index]
+                if tuple(map(str, tree.item(iid, "values"))) != tuple(map(str, values)):
+                    tree.item(iid, values=values)
+            else:
+                tree.insert("", "end", values=values)
+        if len(children) > len(rows):
+            tree.delete(*children[len(rows):])
 
     def draw(self, rows):
+        # Kept for old callers and small, headless Canvas regression checks.
+        if hasattr(self, "stock_chart"):
+            self.stock_chart.set_data(self.result or {"intraday": rows})
+            return
         self.canvas.delete("all")
-        prices = [num(x.get("\u4ef7\u683c")) for x in rows]
-        prices = [x for x in prices if x is not None]
-        w, h = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        prices = [num(row.get("价格")) for row in rows]
+        prices = [value for value in prices if value is not None]
+        width, height = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         if not prices:
-            self.canvas.create_text(w / 2, h / 2, text="\u67e5\u8be2\u540e\u663e\u793a\u5206\u65f6\u56fe", fill="#94a3b8")
+            self.canvas.create_text(width / 2, height / 2, text="暂无分时数据", fill="#94a3b8")
             return
         left, right, top, bottom = 52, 18, 30, 32
-        plot_w, plot_h = max(1, w - left - right), max(1, h - top - bottom)
+        plot_width, plot_height = max(1, width - left - right), max(1, height - top - bottom)
         low, high = min(prices), max(prices)
         if high <= low:
             high = low + 1
         points = []
-        for i, value in enumerate(prices):
-            x = left + i * plot_w / max(1, len(prices) - 1)
-            y = top + (high - value) * plot_h / (high - low)
-            points += [x, y]
-        self.canvas.create_line(*points, fill="#38bdf8", width=2, smooth=True)
-        self.canvas.create_text(left, 12, anchor="w", text="\u5206\u65f6\u4ef7\u683c", fill="white")
-        self.canvas.create_text(left, h - 10, anchor="w", text=f"{low:.2f}", fill="#94a3b8")
+        for index, value in enumerate(prices):
+            points += [left + index * plot_width / max(1, len(prices) - 1), top + (high - value) * plot_height / (high - low)]
+        if len(points) >= 4:
+            self.canvas.create_line(*points, fill="#38bdf8", width=2, smooth=False)
+        else:
+            x, y = points
+            self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#38bdf8", outline="")
+        self.canvas.create_text(left, 12, anchor="w", text="分时价格", fill="white")
+        self.canvas.create_text(left, height - 10, anchor="w", text=f"{low:.2f}", fill="#94a3b8")
         self.canvas.create_text(left, top, anchor="w", text=f"{high:.2f}", fill="#94a3b8")
 
-    def do_export(self):
-        if not self.result: return
-        folder=filedialog.askdirectory(title="\u9009\u62e9\u5bfc\u51fa\u76ee\u5f55")
-        if folder: messagebox.showinfo("\u5bfc\u51fa\u5b8c\u6210","\n".join(map(str,export_result(self.result,folder))))
+    def choose_export_folder(self):
+        from workspace_state import PROJECT_ROOT
+        if not self.result or self.export_busy:
+            return
+        initial = self.preferences.get("last_export_dir") or str(PROJECT_ROOT / "导出数据")
+        if not Path(initial).is_dir():
+            initial = str(PROJECT_ROOT)
+        folder = filedialog.askdirectory(title="选择分析数据导出目录", initialdir=initial)
+        if folder:
+            self.do_export(folder)
+
+    def do_export(self, folder=None):
+        from workspace_state import PROJECT_ROOT
+        if not self.result or self.export_busy:
+            return
+        if self.pending_query is not None or self.history_resync_pending:
+            self.status.set("查询或交易日同步尚未完成，请等待一致的分析快照后导出。")
+            return
+        import copy
+        target = Path(folder) if folder else PROJECT_ROOT / "导出数据" / str(self.result["identity"]["code"])
+        snapshot = copy.deepcopy(self.result)
+        self.export_busy = True
+        self.export.configure(state="disabled")
+        self.choose_export_button.configure(state="disabled")
+        self.status.set(f"正在保存完整分析快照至 {target}…")
+        # Publishing must finish cleanly even if the user closes the window.
+        threading.Thread(target=self.export_worker, args=(snapshot, target), daemon=False).start()
+
+    def export_worker(self, snapshot, folder):
+        try:
+            paths = export_result(snapshot, folder)
+            self.events.put(("exported", (paths, folder)))
+        except Exception as exc:
+            self.events.put(("export_error", str(exc)))
+
+    def close(self):
+        self.closing = True
+        self.ai_panel.close()
+        self.research_panel.close()
+        self.live_enabled = False
+        self.live_generation += 1
+        if self.live_job is not None:
+            self.after_cancel(self.live_job)
+        if self.poll_job is not None:
+            self.after_cancel(self.poll_job)
+        self.persist_preferences()
+        self.destroy()
 
 
 def self_test(query: str) -> int:
-    c=Client(); identity=c.resolve(parse_query(query)); result=c.fetch(identity); print("resolved",identity.code,identity.market); print("rows",len(result["intraday"]),len(result["details"]),len(result["daily"]),len(result["billboard"])); print("errors",result["errors"]); print("health");
-    for row in c.health(identity): print(row)
-    paths=export_result(result,str(Path.cwd()/"exports")); print("exported",len(paths)); return 0
+    """Read-only live check: do not create exports or repeat unrelated probes."""
+    started = time.perf_counter()
+    result = Client().fetch(parse_query(query))
+    summary = {
+        "code": result["identity"]["code"], "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "rows": {key: len(result.get(key) or []) for key in ("daily_history", "intraday", "details", "benchmark_history")},
+        "quote_time": (result.get("quote") or {}).get("行情时间"),
+        "details_meta": result.get("details_meta"), "errors": result.get("errors"),
+        "quality_checks": build_quality_checks(result),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False))
+    valid_quote = num((result.get("quote") or {}).get("最新价"))
+    return 0 if valid_quote is not None and valid_quote > 0 and all(result.get(key) for key in ("daily_history", "intraday", "details")) else 1
 
 
 def main() -> int:
